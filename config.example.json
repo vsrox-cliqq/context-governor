@@ -8,6 +8,9 @@
   "head_chars": 1500,
   "tail_messages": 6,
   "summarizer_cmd": "",
+  "agent_cmd": "",
+  "max_sessions": 8,
+  "session_timeout": 3600,
   "tools": {
     "cursor": { "window_tokens": 200000, "bytes_per_token": 4 },
     "claude_code": { "window_tokens": 200000 }

@@ -18,6 +18,8 @@ Subcommands:
   hook     read a Cursor / Claude Code hook payload on stdin, emit hook JSON
   compact  snapshot a transcript into a handoff state file
   status   show estimated context usage for recent sessions
+  run      fully autonomous mode: loop headless agent sessions, each scoped to
+           one plan slice ending in a ledger entry, until the ledger says DONE
 """
 
 import argparse
@@ -25,6 +27,8 @@ import glob
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -41,6 +45,9 @@ DEFAULT_CONFIG = {
     "head_chars": 1500,
     "tail_messages": 6,
     "summarizer_cmd": "",
+    "agent_cmd": "",
+    "max_sessions": 8,
+    "session_timeout": 3600,
     "tools": {
         "cursor": {"window_tokens": 200000, "bytes_per_token": 4},
         "claude_code": {"window_tokens": 200000},
@@ -602,6 +609,113 @@ def cmd_compact(args):
     print(str(out))
 
 
+# ------------------------------------------------------- autonomous run ---
+
+RUN_PROTOCOL = """PROTOCOL (context-governor autonomous run):
+You are ONE session in a chain of headless agent sessions executing a larger
+plan. Nobody is watching interactively; never ask questions — make reasonable
+decisions and record them.
+
+1. Scope this session to exactly ONE plan slice (one stage or sub-task).
+2. Verify your work (run tests/build) before finishing; report results honestly.
+3. Before finishing you MUST append a handoff entry to {ledger} following the
+   entry format documented at the top of that file. Never edit prior entries.
+4. The entry MUST contain a line starting with '**Next step (exact):**'.
+   Name the single next atomic action — or write exactly DONE if the entire
+   plan is complete and verified.
+5. After appending the ledger entry, stop. Do not start the next slice.
+"""
+
+
+def is_done(entry):
+    m = re.search(r"next step\s*\(exact\)\s*:?\**\s*(.+)", entry, re.I)
+    return bool(m and re.match(r"\s*\**\s*DONE\b", m.group(1)))
+
+
+def detect_agent_cmd():
+    if shutil.which("cursor-agent"):
+        return "cursor-agent -p {prompt} --output-format text"
+    if shutil.which("claude"):
+        return "claude -p {prompt}"
+    return None
+
+
+def build_run_prompt(cfg, entry, task):
+    parts = [RUN_PROTOCOL.format(ledger=cfg["ledger_path"])]
+    if entry:
+        parts.append(
+            "RESUME: the latest handoff ledger entry follows. Treat its 'Next "
+            "step' as this session's task and its risks as constraints.\n\n"
+            + entry
+        )
+        if task:
+            parts.append("OVERALL GOAL (for orientation only): " + task)
+    else:
+        parts.append("TASK (first session of the run): " + task)
+    return "\n\n".join(parts)
+
+
+def cmd_run(args):
+    cfg = load_config(args.workspace)
+    agent_cmd = args.agent_cmd or cfg.get("agent_cmd") or detect_agent_cmd()
+    if not agent_cmd:
+        sys.exit("No agent CLI found. Install cursor-agent or claude, or pass "
+                 "--agent-cmd 'your-cli {prompt}'.")
+    ledger = ensure_ledger(args.workspace, cfg)
+    max_sessions = args.max_sessions or cfg.get("max_sessions", 8)
+    timeout = cfg.get("session_timeout", 3600)
+    log_path = state_dir() / "run-{}.log".format(time.strftime("%Y%m%d-%H%M%S"))
+
+    entry = last_ledger_entry(ledger)
+    if not entry and not args.task:
+        sys.exit("Ledger has no entries yet; pass --task for the first session.")
+
+    for i in range(1, max_sessions + 1):
+        if entry and is_done(entry):
+            print("Plan marked DONE in ledger. Stopping after {} session(s)."
+                  .format(i - 1))
+            return
+        prompt = build_run_prompt(cfg, entry, args.task)
+        if "{prompt}" in agent_cmd:
+            cmd = agent_cmd.replace("{prompt}", shlex.quote(prompt))
+            stdin_text = None
+        else:
+            cmd, stdin_text = agent_cmd, prompt
+        print("[session {}/{}] {}".format(i, max_sessions, agent_cmd))
+        print("  log: {}".format(log_path))
+        with open(log_path, "a") as log:
+            log.write("\n===== session {} @ {} =====\n".format(
+                i, datetime.now().isoformat(timespec="seconds")))
+            log.flush()
+            try:
+                result = subprocess.run(
+                    cmd, shell=True, cwd=args.workspace, input=stdin_text,
+                    stdout=log, stderr=subprocess.STDOUT, text=True,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                print("  session timed out after {}s; stopping.".format(timeout))
+                sys.exit(1)
+        if result.returncode != 0:
+            print("  agent exited with code {}; stopping. See log."
+                  .format(result.returncode))
+            sys.exit(1)
+        new_entry = last_ledger_entry(ledger)
+        if new_entry == entry:
+            print("  no new ledger entry was appended — the agent did not "
+                  "follow the handoff protocol; stopping to avoid burning "
+                  "sessions. See log.")
+            sys.exit(1)
+        entry = new_entry
+        step = re.search(r"next step.*", entry, re.I)
+        print("  ledger updated; {}".format(step.group(0) if step else
+                                            "(no next-step line found)"))
+
+    print("Reached max sessions ({}) without DONE. Latest ledger entry:\n\n{}"
+          .format(max_sessions, entry))
+    sys.exit(1)
+
+
 # ---------------------------------------------------------------- status ---
 
 def cmd_status():
@@ -641,6 +755,16 @@ def main():
     pc.add_argument("--out", required=True)
     pc.add_argument("--workspace", default=os.getcwd())
     sub.add_parser("status")
+    pr = sub.add_parser("run")
+    pr.add_argument("--workspace", default=os.getcwd())
+    pr.add_argument("--task", default="",
+                    help="task for the first session (required if the ledger "
+                         "is empty)")
+    pr.add_argument("--agent-cmd", default="",
+                    help="agent CLI template; {prompt} is replaced with the "
+                         "quoted prompt, otherwise the prompt is piped to "
+                         "stdin (default: autodetect cursor-agent / claude)")
+    pr.add_argument("--max-sessions", type=int, default=0)
     args = parser.parse_args()
 
     if args.cmd == "hook":
@@ -649,6 +773,8 @@ def main():
         cmd_compact(args)
     elif args.cmd == "status":
         cmd_status()
+    elif args.cmd == "run":
+        cmd_run(args)
     else:
         parser.print_help()
         sys.exit(1)

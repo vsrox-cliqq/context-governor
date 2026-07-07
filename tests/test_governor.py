@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from shlex import quote as shlex_quote
 
 ROOT = Path(__file__).resolve().parent.parent
 GOVERNOR = ROOT / "governor.py"
@@ -263,6 +264,76 @@ class GovernorTest(unittest.TestCase):
         self.assertIn("Build stage 4C of the plan", body)
         # ledger scaffolded in workspace
         self.assertTrue((self.workspace / "handoff" / "LEDGER.md").exists())
+
+    # ---- autonomous run ---------------------------------------------------
+
+    def fake_agent(self, script_body):
+        """Create a fake agent CLI: a python script that receives the prompt
+        on stdin and can append ledger entries in the workspace."""
+        path = Path(self.tmp.name) / "fake_agent.py"
+        path.write_text(script_body)
+        return "{} {}".format(shlex_quote(sys.executable), shlex_quote(str(path)))
+
+    def run_driver(self, agent_cmd, task="build the thing", max_sessions=5):
+        return subprocess.run(
+            [sys.executable, str(GOVERNOR), "run",
+             "--workspace", str(self.workspace),
+             "--task", task, "--agent-cmd", agent_cmd,
+             "--max-sessions", str(max_sessions)],
+            capture_output=True, text=True, env=self.env, timeout=60,
+        )
+
+    def test_run_loops_until_done(self):
+        agent = self.fake_agent(
+            "import sys, pathlib\n"
+            "prompt = sys.stdin.read()\n"
+            "assert 'PROTOCOL' in prompt\n"
+            "ledger = pathlib.Path('handoff/LEDGER.md')\n"
+            "n = ledger.read_text().count('## session')\n"
+            "step = 'DONE' if n >= 2 else 'do slice %d' % (n + 2)\n"
+            "ledger.open('a').write('\\n---\\n## session %d\\n"
+            "**Next step (exact):** %s\\n' % (n + 1, step))\n"
+        )
+        result = self.run_driver(agent)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Plan marked DONE", result.stdout)
+        ledger = (self.workspace / "handoff" / "LEDGER.md").read_text()
+        self.assertEqual(ledger.count("## session"), 3)
+
+    def test_run_resumes_from_existing_entry(self):
+        ledger = self.workspace / "handoff" / "LEDGER.md"
+        ledger.parent.mkdir(parents=True)
+        ledger.write_text(
+            "# L\n\n<!-- Entries below. -->\n\n---\n## prior\n"
+            "**Next step (exact):** finish stage 9\n"
+        )
+        agent = self.fake_agent(
+            "import sys, pathlib\n"
+            "prompt = sys.stdin.read()\n"
+            "assert 'finish stage 9' in prompt, 'resume entry not in prompt'\n"
+            "pathlib.Path('handoff/LEDGER.md').open('a').write(\n"
+            "    '\\n---\\n## after\\n**Next step (exact):** DONE\\n')\n"
+        )
+        result = self.run_driver(agent, task="")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_run_stops_when_agent_skips_ledger(self):
+        agent = self.fake_agent("import sys; sys.stdin.read()\n")
+        result = self.run_driver(agent)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no new ledger entry", result.stdout)
+
+    def test_run_already_done_is_noop(self):
+        ledger = self.workspace / "handoff" / "LEDGER.md"
+        ledger.parent.mkdir(parents=True)
+        ledger.write_text(
+            "# L\n\n<!-- Entries below. -->\n\n---\n## final\n"
+            "**Next step (exact):** DONE\n"
+        )
+        agent = self.fake_agent("raise SystemExit('must not be called')\n")
+        result = self.run_driver(agent, task="")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("DONE", result.stdout)
 
     def test_compact_with_summarizer_cmd(self):
         self.write_config({"summarizer_cmd": "echo 'MODEL SUMMARY OK'"})

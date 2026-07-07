@@ -8,6 +8,7 @@ Long agentic sessions degrade: past ~60% of the context window, models drift, fo
 2. **Warns** the agent at a soft threshold (default 50%): *finish the slice in flight, start nothing new.*
 3. **Forces a handoff** at a hard threshold (default 60%): the agent must append a structured entry to an append-only **handoff ledger** and end the session — while a detached **compactor** snapshots the session state in the background.
 4. **Bootstraps** the next session automatically from the ledger (via a `SessionStart` hook in Claude Code, and a project rule in Cursor), so multi-session plans continue without you copy-pasting context.
+5. Optionally **runs the whole loop unattended**: `governor.py run` chains headless sessions through the ledger until the plan is done (see [autonomous mode](#fully-autonomous-mode-governorpy-run)).
 
 One file, Python 3.9+ stdlib only, no dependencies. Auditable in five minutes.
 
@@ -70,12 +71,43 @@ Copy `config.example.json` to `~/.context-governor/config.json` (user-level) or 
 - **At 60%**: a hard order — park the atomic step in progress, append a ledger entry to `handoff/LEDGER.md`, tell the user to start a fresh session. Meanwhile a detached compactor writes `handoff/state-<session>.md`.
 - **Next session**: Claude Code injects the last ledger entry at `SessionStart`; Cursor picks it up through the always-on project rule. The agent starts from "Next step", not from zero.
 
+## Fully autonomous mode: `governor.py run`
+
+Interactive sessions still need a human to open the next chat after a handoff.
+`run` removes the human: it loops **headless** agent sessions — each scoped to
+one plan slice and required to end with a ledger entry — until the ledger's
+"Next step" says `DONE`:
+
+```bash
+python3 governor.py run --workspace /path/to/repo \
+  --task "Implement the remaining stages of build-plan.md"
+```
+
+Each iteration builds a prompt from the latest ledger entry (or `--task` on
+the first run), executes the agent CLI (`cursor-agent` or `claude -p`,
+autodetected; override with `--agent-cmd 'your-cli {prompt}'`), and checks the
+ledger afterwards. Safety rails:
+
+- **No-progress stop**: if a session ends without appending a ledger entry,
+  the loop stops immediately instead of burning sessions.
+- **`max_sessions`** cap (default 8) and per-session `session_timeout`
+  (default 1h).
+- Full agent output is logged to `~/.context-governor/state/run-<ts>.log`.
+
+This is the Hermes outer loop, transplanted: bounded sessions, transactional
+state transfer through the ledger, no human in between. Note that headless
+agents typically need permission flags to edit files unattended (e.g.
+`--agent-cmd 'claude -p {prompt} --permission-mode acceptEdits'`) — grant only
+what you're comfortable with; the driver intentionally doesn't default to
+skipping permissions.
+
 ## Commands
 
 ```bash
 python3 governor.py status      # context usage of recent Cursor + Claude sessions
 python3 governor.py compact --transcript <path.jsonl> --out state.md   # manual snapshot
-python3 tests/test_governor.py  # run the test suite (12 tests, stdlib only)
+python3 governor.py run --task "..."   # autonomous multi-session execution
+python3 tests/test_governor.py  # run the test suite (19 tests, stdlib only)
 ```
 
 ## How measurement works
