@@ -1,0 +1,624 @@
+#!/usr/bin/env python3
+"""context-governor — a context-budget engine for hook-based coding agents.
+
+Borrowed from NousResearch/hermes-agent's ContextEngine design:
+  * threshold-driven monitoring of context usage,
+  * head/tail protection with middle compaction,
+  * a background compactor that runs outside the agent's inference loop.
+
+Adapted for tools we don't control (Cursor, Claude Code): we cannot rewrite
+the live context in place, so compaction happens ACROSS sessions — when the
+budget is hit, a detached compactor snapshots the session (head + digest +
+tail) to a state file, the agent appends a handoff entry to an append-only
+ledger, and the next session bootstraps from both.
+
+Stdlib only. One file. Python 3.9+.
+
+Subcommands:
+  hook     read a Cursor / Claude Code hook payload on stdin, emit hook JSON
+  compact  snapshot a transcript into a handoff state file
+  status   show estimated context usage for recent sessions
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+DEFAULT_CONFIG = {
+    "warn_pct": 50,
+    "handoff_pct": 60,
+    "refire_delta_pct": 3,
+    "ledger_path": "handoff/LEDGER.md",
+    "state_dir": "handoff",
+    "auto_compact": True,
+    "head_chars": 1500,
+    "tail_messages": 6,
+    "summarizer_cmd": "",
+    "tools": {
+        "cursor": {"window_tokens": 200000, "bytes_per_token": 4},
+        "claude_code": {"window_tokens": 200000},
+    },
+}
+
+LEDGER_TEMPLATE = """# Session Handoff Ledger
+
+Append-only log passing state between agent sessions. Managed by
+context-governor (https://github.com/OWNER/context-governor).
+
+## Rules
+
+- **Append only.** Never edit or delete previous entries; the newest entry at
+  the bottom is the authoritative state.
+- Every session that hits the context budget (or ends mid-task) MUST append an
+  entry before stopping.
+- Every fresh session MUST read the LAST entry before doing anything else,
+  then follow its "Next step".
+- Reference artifacts (plans, progress docs, commits) by path; do not
+  duplicate their content here.
+
+## Entry format
+
+```markdown
+---
+## <YYYY-MM-DD HH:MM> — <short description>
+
+**Plan stage / slice:** <what slice of the plan this session took>
+**Completed this session:**
+- <what was done, with file paths>
+
+**Verification status:** <tests run and results / explicitly "not verified">
+**Current state:** <where things stand; anything half-done and how it was parked>
+**Next step (exact):** <the single next atomic action for the next session>
+**Open risks / gotchas:** <anything the next session must know>
+**Key files:** <paths touched or that must be read first>
+**State snapshot:** <path to the machine-written state file, if any>
+```
+
+<!-- Entries below. Newest at the bottom. -->
+"""
+
+
+# ---------------------------------------------------------------- config ---
+
+def load_config(workspace=None):
+    """Merge config from defaults <- user config <- workspace config <- $CG_CONFIG."""
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
+    candidates = [Path.home() / ".context-governor" / "config.json"]
+    if workspace:
+        candidates.append(Path(workspace) / ".context-governor.json")
+    if os.environ.get("CG_CONFIG"):
+        candidates.append(Path(os.environ["CG_CONFIG"]))
+    for path in candidates:
+        try:
+            with open(path) as f:
+                overlay = json.load(f)
+        except (OSError, ValueError):
+            continue
+        for key, value in overlay.items():
+            if key == "tools" and isinstance(value, dict):
+                for tool, tool_cfg in value.items():
+                    cfg["tools"].setdefault(tool, {}).update(tool_cfg)
+            else:
+                cfg[key] = value
+    return cfg
+
+
+def state_dir():
+    base = os.environ.get("CG_STATE_DIR") or str(
+        Path.home() / ".context-governor" / "state"
+    )
+    Path(base).mkdir(parents=True, exist_ok=True)
+    return Path(base)
+
+
+# ----------------------------------------------------------- measurement ---
+
+def measure_claude(transcript_path, cfg):
+    """Real context size: token usage reported on the last assistant message."""
+    window = cfg["tools"]["claude_code"].get("window_tokens", 200000)
+    try:
+        with open(transcript_path, "rb") as f:
+            lines = f.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if '"usage"' not in line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        usage = (entry.get("message") or {}).get("usage")
+        if not usage or "input_tokens" not in usage:
+            continue
+        tokens = (
+            usage.get("input_tokens", 0)
+            + usage.get("cache_read_input_tokens", 0)
+            + usage.get("cache_creation_input_tokens", 0)
+        )
+        return {"tokens": tokens, "window": window, "pct": tokens * 100 // window}
+    return None
+
+
+def cursor_transcript_path(conversation_id):
+    roots = os.environ.get("CG_CURSOR_PROJECTS") or str(
+        Path.home() / ".cursor" / "projects"
+    )
+    pattern = os.path.join(
+        roots, "*", "agent-transcripts", conversation_id, conversation_id + ".jsonl"
+    )
+    matches = glob.glob(pattern)
+    return matches[0] if matches else None
+
+
+def measure_cursor(conversation_id, cfg):
+    """Proxy context size: transcript bytes / bytes_per_token."""
+    tool_cfg = cfg["tools"]["cursor"]
+    window = tool_cfg.get("window_tokens", 200000)
+    bpt = tool_cfg.get("bytes_per_token", 4)
+    path = cursor_transcript_path(conversation_id)
+    if not path:
+        return None
+    try:
+        tokens = os.path.getsize(path) // bpt
+    except OSError:
+        return None
+    return {"tokens": tokens, "window": window, "pct": tokens * 100 // window,
+            "transcript": path}
+
+
+# -------------------------------------------------------- level tracking ---
+
+def decide_level(session_id, pct, cfg):
+    """Return 'warn' | 'handoff' | None using per-session persisted state.
+
+    warn fires once; handoff fires on first crossing then again every
+    refire_delta_pct if the agent keeps going.
+    """
+    sf = state_dir() / (re.sub(r"[^A-Za-z0-9_-]", "_", session_id) + ".json")
+    prev = {"level": 0, "pct": 0}
+    try:
+        with open(sf) as f:
+            prev = json.load(f)
+    except (OSError, ValueError):
+        pass
+
+    level = 0
+    if pct >= cfg["warn_pct"]:
+        level = 1
+    if pct >= cfg["handoff_pct"]:
+        level = 2
+
+    fire = None
+    if level == 2 and (
+        prev["level"] < 2 or pct - prev["pct"] >= cfg["refire_delta_pct"]
+    ):
+        fire = "handoff"
+    elif level == 1 and prev["level"] < 1:
+        fire = "warn"
+
+    if fire:
+        with open(sf, "w") as f:
+            json.dump({"level": level, "pct": pct, "ts": time.time()}, f)
+    return fire
+
+
+# --------------------------------------------------------------- messages ---
+
+def warn_message(m, cfg):
+    return (
+        "CONTEXT BUDGET WARNING: estimated context usage is {pct}% of the window "
+        "(~{tok} of {win} tokens); forced handoff triggers at {hard}%. Aim to reach "
+        "a clean stopping point on the current slice. Do not start any new stage, "
+        "large exploration, or broad refactor in this session. Prefer finishing and "
+        "verifying what is in flight so the handoff is clean."
+    ).format(pct=m["pct"], tok=m["tokens"], win=m["window"], hard=cfg["handoff_pct"])
+
+
+def handoff_message(m, cfg, snapshot_path=None):
+    snap = (
+        " A machine-written state snapshot is being saved to {p}; reference it in "
+        "your ledger entry.".format(p=snapshot_path)
+        if snapshot_path
+        else ""
+    )
+    return (
+        "CONTEXT BUDGET EXCEEDED: estimated context usage is {pct}% (~{tok} of "
+        "{win} tokens), above the {hard}% handoff threshold. STOP taking on new "
+        "work now. Do the following in order: (1) finish or safely park ONLY the "
+        "atomic step currently in progress — do not start the next step; "
+        "(2) append a handoff entry to {ledger} following the entry format "
+        "documented at the top of that file (create it from the documented format "
+        "if missing) — completed work, verification status, current state, exact "
+        "next step, open risks, key files;{snap} (3) end your turn by telling the "
+        "user: context budget reached, handoff written, please start a FRESH "
+        "session. Do not attempt further implementation in this session."
+    ).format(
+        pct=m["pct"], tok=m["tokens"], win=m["window"], hard=cfg["handoff_pct"],
+        ledger=cfg["ledger_path"], snap=snap,
+    )
+
+
+# ------------------------------------------------------------ hook entry ---
+
+def emit(payload):
+    sys.stdout.write(json.dumps(payload))
+
+
+def spawn_compactor(transcript, out_path, workspace):
+    try:
+        subprocess.Popen(
+            [
+                sys.executable, os.path.abspath(__file__), "compact",
+                "--transcript", transcript, "--out", str(out_path),
+                "--workspace", workspace,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        pass
+
+
+def last_ledger_entry(ledger_file):
+    try:
+        text = Path(ledger_file).read_text()
+    except OSError:
+        return None
+    # Only look below the entries marker so the documented entry-format
+    # template in the header is never mistaken for a real entry.
+    marker = "<!-- Entries below"
+    if marker in text:
+        text = text.split(marker, 1)[1]
+        text = text.split("-->", 1)[-1]
+    parts = text.split("\n---\n")
+    if len(parts) < 2:
+        return None
+    return parts[-1].strip() or None
+
+
+def cmd_hook():
+    try:
+        payload = json.load(sys.stdin)
+    except ValueError:
+        emit({})
+        return
+
+    is_claude = "transcript_path" in payload or payload.get("hook_event_name") in (
+        "SessionStart", "PostToolUse", "PreToolUse", "UserPromptSubmit", "Stop",
+    )
+    is_cursor = "conversation_id" in payload and not is_claude
+
+    if is_claude:
+        workspace = payload.get("cwd") or os.getcwd()
+        cfg = load_config(workspace)
+
+        # Session bootstrap: inject the last ledger entry into a fresh session.
+        if payload.get("hook_event_name") == "SessionStart":
+            entry = last_ledger_entry(Path(workspace) / cfg["ledger_path"])
+            if entry:
+                emit({
+                    "hookSpecificOutput": {
+                        "hookEventName": "SessionStart",
+                        "additionalContext": (
+                            "RESUME PROTOCOL (context-governor): this workspace runs "
+                            "long plans across sessions with a context budget. The "
+                            "latest handoff ledger entry follows — treat its 'Next "
+                            "step' as your starting task and its risks as "
+                            "constraints. Scope this session to ONE slice.\n\n" + entry
+                        ),
+                    }
+                })
+            else:
+                emit({})
+            return
+
+        transcript = payload.get("transcript_path", "")
+        m = measure_claude(transcript, cfg) if transcript else None
+        if not m:
+            emit({})
+            return
+        session = payload.get("session_id") or "claude-unknown"
+        fire = decide_level(session, m["pct"], cfg)
+        if fire == "handoff":
+            snap = Path(workspace) / cfg["state_dir"] / (
+                "state-" + session[:8] + ".md"
+            )
+            if cfg.get("auto_compact"):
+                spawn_compactor(transcript, snap, workspace)
+                msg = handoff_message(m, cfg, str(snap))
+            else:
+                msg = handoff_message(m, cfg)
+        elif fire == "warn":
+            msg = warn_message(m, cfg)
+        else:
+            emit({})
+            return
+        emit({
+            "hookSpecificOutput": {
+                "hookEventName": payload.get("hook_event_name", "PostToolUse"),
+                "additionalContext": msg,
+            }
+        })
+        return
+
+    if is_cursor:
+        roots = payload.get("workspace_roots") or []
+        workspace = roots[0] if roots else os.getcwd()
+        cfg = load_config(workspace)
+        m = measure_cursor(payload["conversation_id"], cfg)
+        if not m:
+            emit({})
+            return
+        fire = decide_level(payload["conversation_id"], m["pct"], cfg)
+        if fire == "handoff":
+            snap = Path(workspace) / cfg["state_dir"] / (
+                "state-" + payload["conversation_id"][:8] + ".md"
+            )
+            if cfg.get("auto_compact"):
+                spawn_compactor(m["transcript"], snap, workspace)
+                msg = handoff_message(m, cfg, str(snap))
+            else:
+                msg = handoff_message(m, cfg)
+        elif fire == "warn":
+            msg = warn_message(m, cfg)
+        else:
+            emit({})
+            return
+        emit({"additional_context": msg})
+        return
+
+    emit({})
+
+
+# ------------------------------------------------------------- compactor ---
+
+def normalize_transcript(path):
+    """Parse Cursor or Claude Code JSONL into [(role, text, tools)] messages.
+
+    tools is a list of (tool_name, salient_arg) for tool_use blocks.
+    """
+    messages = []
+    try:
+        lines = Path(path).read_text(errors="replace").splitlines()
+    except OSError:
+        return messages
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        msg = entry.get("message")
+        if not isinstance(msg, dict):
+            continue
+        role = entry.get("role") or msg.get("role") or entry.get("type") or "?"
+        content = msg.get("content")
+        if isinstance(content, str):
+            messages.append((role, content, []))
+            continue
+        if not isinstance(content, list):
+            continue
+        texts, tools = [], []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                texts.append(block.get("text", ""))
+            elif btype == "tool_use":
+                arg = ""
+                inp = block.get("input") or {}
+                for key in ("path", "file_path", "target_notebook", "command",
+                            "pattern", "url"):
+                    if inp.get(key):
+                        arg = str(inp[key])
+                        break
+                tools.append((block.get("name", "?"), arg))
+        if texts or tools:
+            messages.append((role, "\n".join(texts), tools))
+    return messages
+
+
+def strip_meta(text):
+    """Drop injected XML-ish wrappers (<user_query>, <system_reminder>, ...)."""
+    inner = re.search(r"<user_query>\s*(.*?)\s*</user_query>", text, re.S)
+    if inner:
+        return inner.group(1)
+    return re.sub(r"<[^>]+>", "", text).strip()
+
+
+def truncate(text, limit):
+    text = text.strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def structural_digest(messages, cfg):
+    """No-LLM fallback: head task + chronological digest + protected tail."""
+    head_chars = cfg.get("head_chars", 1500)
+    tail_n = cfg.get("tail_messages", 6)
+
+    head = ""
+    for role, text, _ in messages:
+        if role == "user" and text.strip():
+            head = strip_meta(text)
+            break
+
+    user_turns, files, commands = [], [], []
+    for role, text, tools in messages:
+        if role == "user" and text.strip():
+            cleaned = strip_meta(text)
+            if cleaned and cleaned != head:
+                user_turns.append(truncate(cleaned, 200))
+        for name, arg in tools:
+            if name in ("Shell", "Bash") and arg:
+                commands.append(truncate(arg, 120))
+            elif arg and ("/" in arg or "\\" in arg):
+                files.append(arg)
+
+    def dedupe(seq, cap):
+        seen, out = set(), []
+        for item in seq:
+            if item not in seen:
+                seen.add(item)
+                out.append(item)
+        return out[-cap:]
+
+    files = dedupe(files, 40)
+    commands = dedupe(commands, 25)
+
+    tail_lines = []
+    for role, text, tools in messages[-tail_n:]:
+        body = truncate(strip_meta(text), 300) if text.strip() else ""
+        tool_note = ", ".join(
+            "{}({})".format(n, truncate(a, 60)) if a else n for n, a in tools
+        )
+        line = "- **{}**: {}".format(role, body or "(no text)")
+        if tool_note:
+            line += " [tools: {}]".format(tool_note)
+        tail_lines.append(line)
+
+    sections = [
+        "## Task (protected head)\n\n" + (truncate(head, head_chars) or "(none found)"),
+        "## Later user instructions\n\n"
+        + ("\n".join("- " + t for t in user_turns[-15:]) or "- (none)"),
+        "## Files touched\n\n"
+        + ("\n".join("- `{}`".format(f) for f in files) or "- (none recorded)"),
+        "## Commands run\n\n"
+        + ("\n".join("- `{}`".format(c) for c in commands) or "- (none recorded)"),
+        "## Recent activity (protected tail)\n\n" + "\n".join(tail_lines),
+    ]
+    return "\n\n".join(sections)
+
+
+def llm_summary(digest, messages, cfg):
+    """Optional Hermes-style compaction: summarize the middle with a cheap model."""
+    cmd = cfg.get("summarizer_cmd", "").strip()
+    if not cmd:
+        return None
+    middle = messages[1:-cfg.get("tail_messages", 6)]
+    middle_text = "\n".join(
+        "[{}] {}".format(role, truncate(strip_meta(text), 500))
+        for role, text, _ in middle if text.strip()
+    )[:48000]
+    prompt = (
+        "You are compacting an AI coding session for handoff to a fresh session. "
+        "Using the structural digest and middle-of-conversation excerpts below, "
+        "write a concise state summary (<= 400 words) with sections: Current "
+        "objective; Completed work; In-flight step; Recommended next step; Risks "
+        "and gotchas; Key files. Be concrete — file paths, commands, decisions.\n\n"
+        "=== STRUCTURAL DIGEST ===\n{}\n\n=== MIDDLE EXCERPTS ===\n{}".format(
+            digest, middle_text
+        )
+    )
+    try:
+        result = subprocess.run(
+            cmd, shell=True, input=prompt, capture_output=True, text=True,
+            timeout=180,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except (subprocess.SubprocessError, OSError):
+        pass
+    return None
+
+
+def ensure_ledger(workspace, cfg):
+    ledger = Path(workspace) / cfg["ledger_path"]
+    if not ledger.exists():
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_text(LEDGER_TEMPLATE)
+    return ledger
+
+
+def cmd_compact(args):
+    cfg = load_config(args.workspace)
+    messages = normalize_transcript(args.transcript)
+    if not messages:
+        sys.exit(1)
+    digest = structural_digest(messages, cfg)
+    summary = llm_summary(digest, messages, cfg)
+
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    parts = [
+        "# Session state snapshot",
+        "",
+        "Generated by context-governor at {} from `{}`.".format(
+            datetime.now().strftime("%Y-%m-%d %H:%M"), args.transcript
+        ),
+        "This is a machine-written compaction (head and tail protected, middle "
+        "digested). The authoritative next step lives in the handoff ledger.",
+        "",
+    ]
+    if summary:
+        parts += ["## Model summary", "", summary, ""]
+    parts += [digest, ""]
+    out.write_text("\n".join(parts))
+
+    if args.workspace:
+        ensure_ledger(args.workspace, cfg)
+    print(str(out))
+
+
+# ---------------------------------------------------------------- status ---
+
+def cmd_status():
+    cfg = load_config(os.getcwd())
+    rows = []
+    roots = os.environ.get("CG_CURSOR_PROJECTS") or str(
+        Path.home() / ".cursor" / "projects"
+    )
+    for path in glob.glob(os.path.join(roots, "*", "agent-transcripts", "*", "*.jsonl")):
+        tokens = os.path.getsize(path) // cfg["tools"]["cursor"].get("bytes_per_token", 4)
+        window = cfg["tools"]["cursor"].get("window_tokens", 200000)
+        rows.append((os.path.getmtime(path), "cursor",
+                     Path(path).stem[:8], tokens, tokens * 100 // window))
+    claude_root = Path.home() / ".claude" / "projects"
+    for path in glob.glob(str(claude_root / "*" / "*.jsonl")):
+        m = measure_claude(path, cfg)
+        if m:
+            rows.append((os.path.getmtime(path), "claude",
+                         Path(path).stem[:8], m["tokens"], m["pct"]))
+    rows.sort(reverse=True)
+    print("{:<8} {:<10} {:>12} {:>6}   thresholds: warn {}% / handoff {}%".format(
+        "tool", "session", "est_tokens", "pct", cfg["warn_pct"], cfg["handoff_pct"]))
+    for _, tool, session, tokens, pct in rows[:15]:
+        flag = " <-- OVER BUDGET" if pct >= cfg["handoff_pct"] else (
+            " <-- warn" if pct >= cfg["warn_pct"] else "")
+        print("{:<8} {:<10} {:>12,} {:>5}%{}".format(tool, session, tokens, pct, flag))
+
+
+# ------------------------------------------------------------------ main ---
+
+def main():
+    parser = argparse.ArgumentParser(prog="context-governor")
+    sub = parser.add_subparsers(dest="cmd")
+    sub.add_parser("hook")
+    pc = sub.add_parser("compact")
+    pc.add_argument("--transcript", required=True)
+    pc.add_argument("--out", required=True)
+    pc.add_argument("--workspace", default=os.getcwd())
+    sub.add_parser("status")
+    args = parser.parse_args()
+
+    if args.cmd == "hook":
+        cmd_hook()
+    elif args.cmd == "compact":
+        cmd_compact(args)
+    elif args.cmd == "status":
+        cmd_status()
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

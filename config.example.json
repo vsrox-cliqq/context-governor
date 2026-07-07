@@ -1,0 +1,15 @@
+{
+  "warn_pct": 50,
+  "handoff_pct": 60,
+  "refire_delta_pct": 3,
+  "ledger_path": "handoff/LEDGER.md",
+  "state_dir": "handoff",
+  "auto_compact": true,
+  "head_chars": 1500,
+  "tail_messages": 6,
+  "summarizer_cmd": "",
+  "tools": {
+    "cursor": { "window_tokens": 200000, "bytes_per_token": 4 },
+    "claude_code": { "window_tokens": 200000 }
+  }
+}

@@ -1,0 +1,37 @@
+---
+description: Multi-session plan execution protocol — bootstrap from and write to the handoff ledger (context-governor)
+alwaysApply: true
+---
+
+# Multi-session plan execution protocol
+
+This workspace runs long plans across many agent sessions with a hard context
+budget. A hook (context-governor) monitors context usage and will instruct you
+when the budget is reached.
+
+## At session start (before any other work)
+
+1. Read the LAST entry of `handoff/LEDGER.md`. If it exists, treat its "Next
+   step" as your starting task and its "Open risks" as constraints. If it
+   references a state snapshot file, read that too. Do not re-derive state the
+   ledger already records.
+2. Scope the session to ONE plan slice (one stage or sub-task sized to fit
+   well inside the context budget). State the slice you are taking before
+   starting.
+
+## While working
+
+- Prefer targeted reads over broad exploration; the plan docs and ledger
+  already carry the project state.
+- When a hook message reports a CONTEXT BUDGET WARNING, stop starting new work
+  and drive the in-flight step to a verifiable stopping point.
+
+## At handoff (when the hook reports CONTEXT BUDGET EXCEEDED, or the session ends mid-plan)
+
+1. Append an entry to `handoff/LEDGER.md` using the format documented at the
+   top of that file. Never edit prior entries.
+2. A valid entry MUST contain a concrete, singular "Next step" and a
+   "Verification status". If verification was not run, say so explicitly — do
+   not claim done.
+3. Tell the user to start a fresh session; the new session will bootstrap from
+   the ledger automatically.
