@@ -50,7 +50,7 @@ DEFAULT_CONFIG = {
 LEDGER_TEMPLATE = """# Session Handoff Ledger
 
 Append-only log passing state between agent sessions. Managed by
-context-governor (https://github.com/OWNER/context-governor).
+context-governor (https://github.com/vsrox-cliqq/context-governor).
 
 ## Rules
 

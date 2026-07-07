@@ -28,7 +28,7 @@ The ledger doubles as a write-ahead log (the `tunc-clm` idea) and its required e
 ## Install
 
 ```bash
-git clone https://github.com/OWNER/context-governor
+git clone https://github.com/vsrox-cliqq/context-governor
 cd context-governor
 
 # Claude Code (user-level) + Cursor (user-level):
