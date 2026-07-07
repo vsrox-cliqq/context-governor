@@ -196,6 +196,25 @@ class GovernorTest(unittest.TestCase):
         out = self.run_hook(self.cursor_payload("conv-b"))
         self.assertIn("CONTEXT BUDGET EXCEEDED", out["additional_context"])
 
+    def test_cursor_real_payload_shape(self):
+        # Real Cursor payloads include transcript_path, session_id, and a
+        # camelCase hook_event_name — they must NOT be routed to the Claude
+        # branch (regression: transcript_path alone used to mean "claude").
+        root = self.env["CG_CURSOR_PROJECTS"]
+        make_cursor_transcript(root, "conv-real", 520 * 1024)  # ~66%
+        transcript = str(Path(root) / "projA" / "agent-transcripts" /
+                         "conv-real" / "conv-real.jsonl")
+        out = self.run_hook({
+            "conversation_id": "conv-real",
+            "session_id": "conv-real",
+            "transcript_path": transcript,
+            "hook_event_name": "postToolUse",
+            "cursor_version": "2.4.0",
+            "tool_name": "Shell",
+            "workspace_roots": [str(self.workspace)],
+        })
+        self.assertIn("CONTEXT BUDGET EXCEEDED", out["additional_context"])
+
     def test_cursor_missing_transcript(self):
         self.assertEqual(self.run_hook(self.cursor_payload("conv-none")), {})
 

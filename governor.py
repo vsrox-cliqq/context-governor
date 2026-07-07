@@ -158,20 +158,19 @@ def cursor_transcript_path(conversation_id):
     return matches[0] if matches else None
 
 
-def measure_cursor(conversation_id, cfg):
+def measure_cursor(transcript_path, cfg):
     """Proxy context size: transcript bytes / bytes_per_token."""
     tool_cfg = cfg["tools"]["cursor"]
     window = tool_cfg.get("window_tokens", 200000)
     bpt = tool_cfg.get("bytes_per_token", 4)
-    path = cursor_transcript_path(conversation_id)
-    if not path:
+    if not transcript_path:
         return None
     try:
-        tokens = os.path.getsize(path) // bpt
+        tokens = os.path.getsize(transcript_path) // bpt
     except OSError:
         return None
     return {"tokens": tokens, "window": window, "pct": tokens * 100 // window,
-            "transcript": path}
+            "transcript": transcript_path}
 
 
 # -------------------------------------------------------- level tracking ---
@@ -195,6 +194,13 @@ def decide_level(session_id, pct, cfg):
         level = 1
     if pct >= cfg["handoff_pct"]:
         level = 2
+
+    # If usage/thresholds moved back down (config change, recalibration),
+    # reset so the escalation can fire again on the next crossing.
+    if level < prev["level"]:
+        with open(sf, "w") as f:
+            json.dump({"level": level, "pct": pct, "ts": time.time()}, f)
+        prev = {"level": level, "pct": pct}
 
     fire = None
     if level == 2 and (
@@ -285,6 +291,23 @@ def last_ledger_entry(ledger_file):
     return parts[-1].strip() or None
 
 
+def heartbeat(payload, measurement=None):
+    """Record the last hook invocation so `install` problems are debuggable."""
+    try:
+        with open(state_dir() / "last-invocation.json", "w") as f:
+            json.dump({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "event": payload.get("hook_event_name", "?"),
+                "tool_call": payload.get("tool_name", "?"),
+                "session": (payload.get("session_id")
+                            or payload.get("conversation_id") or "?"),
+                "pct": measurement["pct"] if measurement else None,
+                "payload_keys": sorted(payload.keys()),
+            }, f, indent=1)
+    except OSError:
+        pass
+
+
 def cmd_hook():
     try:
         payload = json.load(sys.stdin)
@@ -292,10 +315,15 @@ def cmd_hook():
         emit({})
         return
 
-    is_claude = "transcript_path" in payload or payload.get("hook_event_name") in (
-        "SessionStart", "PostToolUse", "PreToolUse", "UserPromptSubmit", "Stop",
+    # Cursor payloads carry cursor_version / conversation_id and camelCase
+    # event names ("postToolUse"); Claude Code uses PascalCase ("PostToolUse")
+    # and has no conversation_id. Both carry transcript_path, so that field
+    # cannot distinguish them.
+    is_cursor = "cursor_version" in payload or "conversation_id" in payload
+    event = payload.get("hook_event_name", "")
+    is_claude = not is_cursor and (
+        "transcript_path" in payload or event[:1].isupper()
     )
-    is_cursor = "conversation_id" in payload and not is_claude
 
     if is_claude:
         workspace = payload.get("cwd") or os.getcwd()
@@ -323,6 +351,7 @@ def cmd_hook():
 
         transcript = payload.get("transcript_path", "")
         m = measure_claude(transcript, cfg) if transcript else None
+        heartbeat(payload, m)
         if not m:
             emit({})
             return
@@ -354,14 +383,19 @@ def cmd_hook():
         roots = payload.get("workspace_roots") or []
         workspace = roots[0] if roots else os.getcwd()
         cfg = load_config(workspace)
-        m = measure_cursor(payload["conversation_id"], cfg)
+        transcript = payload.get("transcript_path") or cursor_transcript_path(
+            payload.get("conversation_id", "")
+        )
+        m = measure_cursor(transcript, cfg)
+        heartbeat(payload, m)
         if not m:
             emit({})
             return
-        fire = decide_level(payload["conversation_id"], m["pct"], cfg)
+        conv = payload.get("conversation_id") or payload.get("session_id", "?")
+        fire = decide_level(conv, m["pct"], cfg)
         if fire == "handoff":
             snap = Path(workspace) / cfg["state_dir"] / (
-                "state-" + payload["conversation_id"][:8] + ".md"
+                "state-" + conv[:8] + ".md"
             )
             if cfg.get("auto_compact"):
                 spawn_compactor(m["transcript"], snap, workspace)
