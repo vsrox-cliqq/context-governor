@@ -15,15 +15,23 @@
 
 ---
 
+For a long implementation, instead of opening `claude` and babysitting it across many chats, run this from your project directory:
+
+```bash
+governor engage
+```
+
+You work exactly as normal — same Claude Code session, same commands. When context approaches the danger zone, the governor fires a clean handoff: the agent appends a structured entry to a local ledger and ends the session. `engage` notices, relaunches a fresh session, and the `SessionStart` hook bootstraps it from that entry. The new session starts from "Next step", not from zero. The between-session re-orientation ritual disappears.
+
 Long agentic sessions degrade: past ~60% of the context window, models drift, forget constraints, and redo work. Claude Code's built-in auto-compact is a seatbelt, not a plan — it fires near ~90–95% (after quality has already degraded), summarizes lossily in-session, and leaves no external record.
 
-`context-governor` is a tiny hook-based engine that acts *before* the wall:
+`context-governor` is the hook-based engine that makes this work:
 
-1. **Measures** real context usage after every tool call — exact token counts from the transcript, against the **actual model's window** (1M for Fable 5 / Opus 4.6+ / Sonnet 4.6+; detected automatically from the transcript).
+1. **Measures** real context usage after every tool call — exact token counts from the transcript, against the **actual model's window** (1M for Fable 5 / Opus 4.6+ / Sonnet 4.6+; detected automatically).
 2. **Warns** the agent at 50%: *finish the slice in flight, start nothing new.*
 3. **Forces a handoff** at 60%: the agent appends a structured entry to an append-only **handoff ledger** and ends the session — while a detached compactor snapshots state in the background.
 4. **Bootstraps** the next session automatically via a `SessionStart` hook — the fresh session starts from "Next step", not from zero.
-5. **Chains sessions** for long engagements: `engage` mode relaunches sessions after each handoff (you stay in the loop); `run` mode goes fully unattended until the plan says DONE.
+5. **`engage`** chains the above into a continuous loop: relaunch after each handoff (staying in the loop), or `run` for fully unattended execution until the ledger says DONE.
 
 One file · Python 3.9+ · stdlib only · auditable in five minutes.
 
@@ -116,7 +124,7 @@ Every warn/handoff message and `status` row shows the resolved model and window,
 
 ---
 
-## What the agent experiences
+## What happens inside a session
 
 ```
 [ 0%  → 50% ]  silent — the hook adds ~10ms per tool call, nothing else
@@ -125,32 +133,25 @@ Every warn/handoff message and `status` row shows the resolved model and window,
                    start nothing new, handoff triggers at 60%
 
 [ at 60% ]     🛑 CONTEXT BUDGET EXCEEDED: park current step, append
-                   handoff entry to handoff/LEDGER.md, tell user to
-                   start a fresh session. Re-fires every 3% if ignored.
+                   handoff entry to handoff/LEDGER.md, end the session.
+                   Re-fires every 3% if ignored.
 
-[ next session] SessionStart hook injects last ledger entry → agent
-                starts from "Next step", not from zero
+[ next session] SessionStart hook injects the last ledger entry → agent
+                starts from "Next step", not from zero.
+                With `engage`: this relaunch is automatic.
 ```
 
 ---
 
-## The flagship: `engage`
-
-The hooks measure and hand off; `engage` is what they're *for*. For a long implementation you'd otherwise babysit across many chats:
+## `engage` options
 
 ```bash
-cd your-project
 governor engage            # asks before each relaunch
 governor engage --auto     # relaunches without asking
+governor engage --max-sessions 12 --claude-cmd "claude --profile work"
 ```
 
-**Nothing extra to install** — `engage` lives in the same single file the hooks run from, and the standard install already put the `governor` command on your PATH. The only requirement: the `claude` CLI, because `engage` launches real interactive sessions in your terminal (it's a terminal feature — the desktop app doesn't apply here).
-
-What happens: `engage` launches an interactive `claude` session and you work in it completely normally. When the 60% handoff fires and the session ends, `engage` notices the new ledger entry and relaunches a fresh session — which the `SessionStart` hook bootstraps from that entry. The between-session re-orientation ritual ("where were we? read this file, we had decided X…") disappears; you just keep typing.
-
-- Stops when a session ends **without** a handoff (natural finish or quit) — so ending a session yourself exits cleanly.
-- Stops when the ledger's "Next step" says `DONE`.
-- Pass `--max-sessions N` to cap (default 8), `--claude-cmd` to override the command.
+Stops automatically when a session ends without a handoff (natural finish or you quit), or when the ledger's "Next step" says `DONE`. No installation beyond the standard install — `engage` requires only the `claude` CLI and runs in any terminal.
 
 ## Fully autonomous mode: `run`
 
