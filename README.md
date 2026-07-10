@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/governor.svg" alt="context-governor mascot — the Context Cop" width="560"/>
+<img src="assets/governor.png" alt="The Governor — context-governor mascot" width="300"/>
 
 # context-governor
 
