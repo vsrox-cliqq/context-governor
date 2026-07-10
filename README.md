@@ -15,13 +15,13 @@
 
 ---
 
-For a long implementation, instead of opening `claude` and babysitting it across many chats, run this from your project directory:
+For a long implementation, run this from your project directory **instead of** `claude`:
 
 ```bash
-governor engage
+governor engage   # this launches Claude — don't open claude separately
 ```
 
-You work exactly as normal — same Claude Code session, same commands. When context approaches the danger zone, the governor fires a clean handoff: the agent appends a structured entry to a local ledger and ends the session. `engage` notices, relaunches a fresh session, and the `SessionStart` hook bootstraps it from that entry. The new session starts from "Next step", not from zero. The between-session re-orientation ritual disappears.
+`engage` starts a Claude Code session in your terminal. You work in it exactly as normal. When context approaches the danger zone, the governor fires a clean handoff: the agent appends a structured entry to a local ledger and ends the session. `engage` notices, relaunches a fresh Claude session, and the `SessionStart` hook bootstraps it from that entry. The new session starts from "Next step", not from zero. The between-session re-orientation ritual disappears.
 
 Long agentic sessions degrade: past ~60% of the context window, models drift, forget constraints, and redo work. Claude Code's built-in auto-compact is a seatbelt, not a plan — it fires near ~90–95% (after quality has already degraded), summarizes lossily in-session, and leaves no external record.
 
