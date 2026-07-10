@@ -45,7 +45,7 @@ On 1M-window models (Opus 4.6+, Sonnet 4.6, Fable 5) auto-compact effectively ne
 
 ## Install
 
-Every path below ends the same way: two hooks merged into `~/.claude/settings.json`, a timestamped backup written first, existing hooks never clobbered. Then restart Claude Code — hooks load at session start.
+One install gives you everything — the measuring hooks **and** the `governor` command (`engage`, `run`, `status`). Every path below ends the same way: two hooks merged into `~/.claude/settings.json` (timestamped backup written first, existing hooks never clobbered) plus a `governor` launcher in `~/.local/bin`. Then restart Claude Code — hooks load at session start.
 
 ### Easiest: let Claude Code install it
 
@@ -72,7 +72,7 @@ Installs to `~/.context-governor/app` (re-running updates it in place).
 /plugin install context-governor@context-governor
 ```
 
-> **Desktop app caveat:** hooks installed via the plugin system only fire in **Cowork** sessions, not the regular Code tab. Desktop app users should use one of the installer paths above instead — the desktop app shares `~/.claude/settings.json` with the CLI, so the same install covers both. **Quit and relaunch** afterwards; hooks don't hot-reload.
+> **Plugin caveats:** the plugin wires the hooks only — it doesn't add the `governor` command, so for `engage`/`run`/`status` use one of the installer paths instead. And in the desktop app, plugin hooks only fire in **Cowork** sessions, not the regular Code tab; desktop users should also prefer the installer paths (the desktop app shares `~/.claude/settings.json` with the CLI, so one install covers both — **quit and relaunch** afterwards; hooks don't hot-reload).
 
 ### Manual
 
@@ -87,10 +87,10 @@ python3 install.py --claude
 After restarting Claude Code and working for a bit:
 
 ```bash
-python3 ~/.context-governor/app/governor.py status   # or ./governor.py from your clone
+governor status
 ```
 
-If recent sessions appear with token counts and model names, the hooks are firing.
+If recent sessions appear with token counts and model names, the hooks are firing. (If `governor` isn't found, `~/.local/bin` isn't on your PATH — the installer prints the one-liner to fix that; or call `python3 ~/.context-governor/app/governor.py status` directly.)
 
 ---
 
@@ -134,25 +134,28 @@ Every warn/handoff message and `status` row shows the resolved model and window,
 
 ---
 
-## Long engagements: `engage`
+## The flagship: `engage`
 
-For a long implementation you'd otherwise babysit across many chats:
+The hooks measure and hand off; `engage` is what they're *for*. For a long implementation you'd otherwise babysit across many chats:
 
 ```bash
-python3 governor.py engage            # in your project directory
-python3 governor.py engage --auto     # relaunch without asking
+cd your-project
+governor engage            # asks before each relaunch
+governor engage --auto     # relaunches without asking
 ```
 
-`engage` launches an interactive `claude` session. When it ends *after a handoff entry was appended*, it relaunches a fresh session — bootstrapped automatically. You keep working normally; the between-session re-orientation disappears.
+**Nothing extra to install** — `engage` lives in the same single file the hooks run from, and the standard install already put the `governor` command on your PATH. The only requirement: the `claude` CLI, because `engage` launches real interactive sessions in your terminal (it's a terminal feature — the desktop app doesn't apply here).
 
-- Stops when a session ends **without** a handoff (natural finish or quit).
+What happens: `engage` launches an interactive `claude` session and you work in it completely normally. When the 60% handoff fires and the session ends, `engage` notices the new ledger entry and relaunches a fresh session — which the `SessionStart` hook bootstraps from that entry. The between-session re-orientation ritual ("where were we? read this file, we had decided X…") disappears; you just keep typing.
+
+- Stops when a session ends **without** a handoff (natural finish or quit) — so ending a session yourself exits cleanly.
 - Stops when the ledger's "Next step" says `DONE`.
 - Pass `--max-sessions N` to cap (default 8), `--claude-cmd` to override the command.
 
 ## Fully autonomous mode: `run`
 
 ```bash
-python3 governor.py run --workspace /path/to/repo \
+governor run --workspace /path/to/repo \
   --task "Implement the remaining stages of build-plan.md"
 ```
 
@@ -165,12 +168,14 @@ Headless agents need permission flags: `--agent-cmd 'claude -p {prompt} --permis
 ## Commands
 
 ```bash
-python3 governor.py status         # context usage of recent sessions (model + window)
-python3 governor.py engage         # chain interactive sessions through the ledger
-python3 governor.py run --task ""  # autonomous multi-session execution
-python3 governor.py compact --transcript <path.jsonl> --out state.md
+governor status         # context usage of recent sessions (model + window)
+governor engage         # chain interactive sessions through the ledger
+governor run --task ""  # autonomous multi-session execution
+governor compact --transcript <path.jsonl> --out state.md
 python3 tests/test_governor.py     # 27 tests, stdlib only
 ```
+
+(`governor` is the launcher the installer drops in `~/.local/bin`; from a clone, `python3 governor.py <cmd>` is identical.)
 
 ---
 

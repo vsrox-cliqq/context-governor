@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import json
+import os
 import shutil
 import sys
 import time
@@ -71,6 +72,24 @@ def install_cursor_rule(project_dir):
     print("  cursor: bootstrap rule installed at {}".format(dest))
 
 
+def install_launcher():
+    """Put a `governor` command on the PATH so engage/status/run are typeable
+    from any project directory (instead of python3 <long path>/governor.py)."""
+    bin_dir = Path.home() / ".local" / "bin"
+    launcher = bin_dir / "governor"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    launcher.write_text('#!/bin/sh\nexec python3 "{}" "$@"\n'.format(GOVERNOR))
+    launcher.chmod(0o755)
+    print("  launcher: {} -> governor.py".format(launcher))
+    on_path = str(bin_dir) in os.environ.get("PATH", "").split(os.pathsep)
+    if not on_path:
+        print("  NOTE: {} is not on your PATH; add it to use the `governor` "
+              "command:".format(bin_dir))
+        print("    echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.zshrc "
+              "&& exec zsh")
+    return on_path
+
+
 def install_claude(settings_file):
     data = load_json(settings_file)
     hooks = data.setdefault("hooks", {})
@@ -114,9 +133,13 @@ def main():
         install_cursor_rule(args.cursor_project)
     if args.claude or args.all:
         install_claude(Path.home() / ".claude" / "settings.json")
+    launcher_on_path = install_launcher()
 
+    cli = "governor" if launcher_on_path else 'python3 "{}"'.format(GOVERNOR)
     print("\nDone. Restart Cursor / Claude Code — hooks load at session start.")
-    print("Verify after working a while:  python3 \"{}\" status".format(GOVERNOR))
+    print("Verify after working a while:  {} status".format(cli))
+    print("Chain sessions on a long task: {} engage   (from your project dir)"
+          .format(cli))
     print("Config (optional): ~/.context-governor/config.json (see config.example.json).")
 
 
