@@ -45,20 +45,15 @@ On 1M-window models (Opus 4.6+, Sonnet 4.6, Fable 5) auto-compact effectively ne
 
 ## Install
 
-**Option A — Claude Code plugin (recommended):**
+### Claude Code CLI
 
-```
-/plugin marketplace add vsrox-cliqq/context-governor
-/plugin install context-governor@context-governor
-```
-
-**Option B — shell one-liner:**
+**One-liner (recommended):**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/vsrox-cliqq/context-governor/main/install.sh | bash
 ```
 
-**Option C — manual:**
+**Manual:**
 
 ```bash
 git clone https://github.com/vsrox-cliqq/context-governor
@@ -66,7 +61,28 @@ cd context-governor
 python3 install.py --claude
 ```
 
-Options B and C merge into `~/.claude/settings.json` and write a timestamped backup first. Existing hooks are never clobbered. Restart Claude Code afterwards.
+Both merge into `~/.claude/settings.json` and write a timestamped backup first. Existing hooks are never clobbered. Restart Claude Code afterwards.
+
+### Claude Code desktop app
+
+The desktop app shares `~/.claude/settings.json` with the CLI, so the same installer works:
+
+```bash
+# from the cloned repo directory:
+python3 install.py --claude
+```
+
+Then **quit and relaunch** the desktop app — hooks don't hot-reload.
+
+> **Note on the plugin GUI:** The desktop app has a plugin browser (hamburger menu → *Add plugin*), but hooks installed via plugins only fire in **Cowork** sessions, not the regular Code tab. For Code tab hook coverage, use the `install.py` path above.
+
+Verify it's working after restart:
+
+```bash
+python3 governor.py status
+```
+
+If recent sessions appear with token counts and model names, the hooks are firing.
 
 ---
 
