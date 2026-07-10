@@ -70,17 +70,50 @@ The ledger is append-only, human-readable, and git-committable. It's not a summa
 
 ---
 
-## What this makes possible
+## Modes
 
-With a build plan or spec in your repo, you can run:
+The hooks run automatically once installed. You choose how to drive the sessions on top of them:
+
+| Mode | Use when | Command |
+|---|---|---|
+| **`engage`** | You're at the terminal — interactive, multi-session work against a spec or long task | `governor engage` (replaces `claude`) |
+| **`run`** | Fully unattended — headless sessions until the plan says DONE | `governor run --task "..."` |
+| **`status`** | Inspect what's been measured — recent sessions, token counts, detected models | `governor status` |
+| **`compact`** | Manual compaction of a specific transcript outside the hook cycle | `governor compact --transcript <path> --out state.md` |
+
+### `engage` — interactive multi-session
+
+Run this **instead of** `claude` in your terminal:
 
 ```bash
-governor engage
+cd your-project
+governor engage            # asks "start fresh session?" before each relaunch
+governor engage --auto     # relaunches without asking
+governor engage --max-sessions 12 --claude-cmd "claude --profile work"
 ```
 
-and work through it across as many sessions as it takes — without re-orientation between sessions, without babysitting context, without manually running `/compact` at the right moment. Each session picks up from the last ledger entry. The governor fires the handoff; `engage` relaunches the session; the hook bootstraps it. You keep working.
+`engage` launches Claude, watches the ledger for new handoff entries, and relaunches a fresh session when one appears — bootstrapped automatically from that entry. You work normally inside each session; the between-session gap disappears. Stops when a session ends without a handoff (natural finish or you quit), or when the ledger says `DONE`.
 
-This is what makes **spec-driven multi-session development** practical: write the plan once, execute across N sessions, let the ledger carry the state.
+This is what makes **spec-driven development practical**: write the plan once, execute across as many sessions as it takes, let the ledger carry the state. No re-orientation, no lost context, no babysitting `/compact`.
+
+### `run` — autonomous / headless
+
+```bash
+governor run --workspace /path/to/repo \
+  --task "Implement the remaining stages of build-plan.md"
+```
+
+Loops headless `claude -p` sessions — each scoped to one plan slice — until the ledger says `DONE`. Safety rails: no-progress stop, `max_sessions` cap (default 8), per-session `session_timeout` (default 1h), full log at `~/.context-governor/state/run-<ts>.log`.
+
+Headless agents need permission flags: `--agent-cmd 'claude -p {prompt} --permission-mode acceptEdits'` — grant only what you're comfortable with.
+
+### `status` — inspect recent sessions
+
+```bash
+governor status
+```
+
+Prints a table of recent sessions: tool (Claude Code / Cursor), session ID, estimated tokens, percentage of window used, and detected model + window size. Run this after installing to confirm the hooks are firing.
 
 ---
 
@@ -135,34 +168,6 @@ If recent sessions appear with token counts and model names, the hooks are firin
 
 ---
 
-## `engage` — multi-session mode
-
-Run this **instead of** `claude` in your terminal:
-
-```bash
-cd your-project
-governor engage            # asks before each relaunch
-governor engage --auto     # relaunches without asking
-governor engage --max-sessions 12 --claude-cmd "claude --profile work"
-```
-
-`engage` launches Claude, watches for handoff entries in the ledger, and relaunches automatically when one appears. You work in each session normally; the between-session gap disappears. Stops when a session ends without a handoff (natural finish or you quit), or when the ledger says `DONE`.
-
-No extra installation — `engage` requires only the `claude` CLI and runs in any terminal.
-
-## Fully autonomous mode: `run`
-
-```bash
-governor run --workspace /path/to/repo \
-  --task "Implement the remaining stages of build-plan.md"
-```
-
-Loops headless `claude -p` sessions — each scoped to one plan slice — until the ledger says `DONE`. Safety rails: no-progress stop, `max_sessions` cap (default 8), per-session `session_timeout` (default 1h), full log at `~/.context-governor/state/run-<ts>.log`.
-
-Headless agents need permission flags: `--agent-cmd 'claude -p {prompt} --permission-mode acceptEdits'` — grant only what you're comfortable with.
-
----
-
 ## Model-aware budgeting
 
 The governor reads the model ID from the transcript and resolves the context window automatically:
@@ -182,20 +187,6 @@ Unknown models fall back to `window_tokens` (default 200,000). To override any m
 ```
 
 Every warn/handoff message and `status` row shows the resolved model and window, so a wrong assumption is immediately visible.
-
----
-
-## Commands
-
-```bash
-governor status         # context usage of recent sessions (model + window)
-governor engage         # chain interactive sessions through the ledger
-governor run --task ""  # autonomous multi-session execution
-governor compact --transcript <path.jsonl> --out state.md
-python3 tests/test_governor.py     # 27 tests, stdlib only
-```
-
-(`governor` is the launcher the installer drops in `~/.local/bin`; from a clone, `python3 governor.py <cmd>` is identical.)
 
 ---
 
