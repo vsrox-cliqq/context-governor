@@ -14,31 +14,31 @@ ROOT = Path(__file__).resolve().parent.parent
 GOVERNOR = ROOT / "governor.py"
 
 
-def make_claude_transcript(path, context_tokens):
+def make_claude_transcript(path, context_tokens, model=""):
     """Write a minimal Claude Code transcript whose last assistant message
-    reports the given context size."""
+    reports the given context size (and, optionally, model ID)."""
+    assistant_message = {
+        "role": "assistant",
+        "content": [
+            {"type": "text", "text": "Working on it."},
+            {"type": "tool_use", "name": "Bash",
+             "input": {"command": "pnpm test"}},
+        ],
+        "usage": {
+            "input_tokens": 3,
+            "cache_read_input_tokens": context_tokens - 103,
+            "cache_creation_input_tokens": 100,
+            "output_tokens": 50,
+        },
+    }
+    if model:
+        assistant_message["model"] = model
     lines = [
         json.dumps({
             "type": "user",
             "message": {"role": "user", "content": "Build stage 4C of the plan"},
         }),
-        json.dumps({
-            "type": "assistant",
-            "message": {
-                "role": "assistant",
-                "content": [
-                    {"type": "text", "text": "Working on it."},
-                    {"type": "tool_use", "name": "Bash",
-                     "input": {"command": "pnpm test"}},
-                ],
-                "usage": {
-                    "input_tokens": 3,
-                    "cache_read_input_tokens": context_tokens - 103,
-                    "cache_creation_input_tokens": 100,
-                    "output_tokens": 50,
-                },
-            },
-        }),
+        json.dumps({"type": "assistant", "message": assistant_message}),
     ]
     Path(path).write_text("\n".join(lines) + "\n")
 
@@ -176,6 +176,52 @@ class GovernorTest(unittest.TestCase):
         out = self.run_hook(self.claude_payload(
             "/nonexistent", event="SessionStart"))
         self.assertEqual(out, {})
+
+    # ---- model-aware window detection -------------------------------------
+
+    def test_1m_model_stays_quiet_at_130k(self):
+        # 130k tokens is 65% of 200k but only 13% of a 1M window: the governor
+        # must respect the model actually in use (regression: hardwired 200k).
+        t = Path(self.tmp.name) / "t.jsonl"
+        make_claude_transcript(t, 130000, model="claude-opus-4-8")
+        self.assertEqual(self.run_hook(self.claude_payload(t)), {})
+
+    def test_1m_suffix_beta_window(self):
+        # Claude Code marks 1M-beta sessions with a "[1m]" ID suffix.
+        t = Path(self.tmp.name) / "t.jsonl"
+        make_claude_transcript(t, 130000, model="claude-sonnet-4-5[1m]")
+        self.assertEqual(self.run_hook(self.claude_payload(t)), {})
+
+    def test_200k_model_fires_and_names_model(self):
+        t = Path(self.tmp.name) / "t.jsonl"
+        make_claude_transcript(t, 130000, model="claude-haiku-4-5")
+        out = self.run_hook(self.claude_payload(t))
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("CONTEXT BUDGET EXCEEDED", ctx)
+        self.assertIn("claude-haiku-4-5", ctx)
+
+    def test_model_windows_config_override_wins(self):
+        # A user override beats the built-in table (here: force opus to 200k).
+        self.write_config({"model_windows": {"claude-opus-4-8": 200000}})
+        t = Path(self.tmp.name) / "t.jsonl"
+        make_claude_transcript(t, 130000, model="claude-opus-4-8")
+        out = self.run_hook(self.claude_payload(t))
+        self.assertIn("CONTEXT BUDGET EXCEEDED",
+                      out["hookSpecificOutput"]["additionalContext"])
+
+    def test_unknown_model_falls_back_to_configured_window(self):
+        self.write_config({"tools": {"claude_code": {"window_tokens": 400000}}})
+        t = Path(self.tmp.name) / "t.jsonl"
+        make_claude_transcript(t, 130000, model="claude-future-9")
+        # 130k of 400k = 32% -> quiet
+        self.assertEqual(self.run_hook(self.claude_payload(t)), {})
+
+    def test_vendor_prefixed_model_id(self):
+        # Bedrock-style IDs still resolve through the built-in table.
+        t = Path(self.tmp.name) / "t.jsonl"
+        make_claude_transcript(t, 130000,
+                               model="us.anthropic.claude-opus-4-8-v1:0")
+        self.assertEqual(self.run_hook(self.claude_payload(t)), {})
 
     # ---- Cursor ----------------------------------------------------------
 
@@ -334,6 +380,43 @@ class GovernorTest(unittest.TestCase):
         result = self.run_driver(agent, task="")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("DONE", result.stdout)
+
+    # ---- interactive engage ------------------------------------------------
+
+    def test_engage_chains_sessions_until_done(self):
+        # Fake "interactive claude": each launch appends a handoff entry,
+        # writing DONE on the second session.
+        agent = self.fake_agent(
+            "import pathlib\n"
+            "ledger = pathlib.Path('handoff/LEDGER.md')\n"
+            "n = ledger.read_text().count('## session')\n"
+            "step = 'DONE' if n >= 1 else 'do slice 2'\n"
+            "ledger.open('a').write('\\n---\\n## session %d\\n"
+            "**Next step (exact):** %s\\n' % (n + 1, step))\n"
+        )
+        result = subprocess.run(
+            [sys.executable, str(GOVERNOR), "engage",
+             "--workspace", str(self.workspace),
+             "--claude-cmd", agent, "--auto", "--max-sessions", "5"],
+            capture_output=True, text=True, env=self.env, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("ledger says DONE", result.stdout)
+        ledger = (self.workspace / "handoff" / "LEDGER.md").read_text()
+        self.assertEqual(ledger.count("## session"), 2)
+
+    def test_engage_stops_without_handoff(self):
+        # A session that ends with no new ledger entry (natural finish or
+        # user quit) must stop the engagement, not relaunch forever.
+        agent = self.fake_agent("pass\n")
+        result = subprocess.run(
+            [sys.executable, str(GOVERNOR), "engage",
+             "--workspace", str(self.workspace),
+             "--claude-cmd", agent, "--auto", "--max-sessions", "5"],
+            capture_output=True, text=True, env=self.env, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("without a handoff", result.stdout)
 
     def test_compact_with_summarizer_cmd(self):
         self.write_config({"summarizer_cmd": "echo 'MODEL SUMMARY OK'"})

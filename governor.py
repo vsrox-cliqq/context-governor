@@ -18,6 +18,8 @@ Subcommands:
   hook     read a Cursor / Claude Code hook payload on stdin, emit hook JSON
   compact  snapshot a transcript into a handoff state file
   status   show estimated context usage for recent sessions
+  engage   chain interactive Claude Code sessions through the ledger: when a
+           session ends after a handoff, relaunch a fresh bootstrapped one
   run      fully autonomous mode: loop headless agent sessions, each scoped to
            one plan slice ending in a ledger entry, until the ledger says DONE
 """
@@ -48,11 +50,51 @@ DEFAULT_CONFIG = {
     "agent_cmd": "",
     "max_sessions": 8,
     "session_timeout": 3600,
+    "model_windows": {},
     "tools": {
         "cursor": {"window_tokens": 200000, "bytes_per_token": 4},
         "claude_code": {"window_tokens": 200000},
     },
 }
+
+# Built-in context windows by model-ID prefix. First match wins, so more
+# specific prefixes must come before generic ones. A "[1m]" suffix on the ID
+# (Claude Code's 1M-context beta marker) always means 1M regardless of base
+# model. Users can override any model via the "model_windows" config map.
+MODEL_WINDOWS = [
+    ("claude-fable", 1000000),
+    ("claude-mythos", 1000000),
+    ("claude-opus-4-6", 1000000),
+    ("claude-opus-4-7", 1000000),
+    ("claude-opus-4-8", 1000000),
+    ("claude-sonnet-4-6", 1000000),
+    ("claude-sonnet-5", 1000000),
+    ("claude-haiku", 200000),
+    ("claude-opus", 200000),
+    ("claude-sonnet", 200000),
+]
+
+
+def resolve_window(model, cfg):
+    """Context window for a model ID.
+
+    Precedence: config "model_windows" override > "[1m]" suffix > built-in
+    table > configured window_tokens > 200k.
+    """
+    fallback = cfg["tools"]["claude_code"].get("window_tokens", 200000)
+    if not model:
+        return fallback
+    for key, win in (cfg.get("model_windows") or {}).items():
+        if key in model:
+            return int(win)
+    if model.endswith("[1m]"):
+        return 1000000
+    # Tolerate vendor-prefixed IDs like "us.anthropic.claude-opus-4-8-v1:0".
+    base = model[model.find("claude-"):] if "claude-" in model else model
+    for prefix, win in MODEL_WINDOWS:
+        if base.startswith(prefix):
+            return win
+    return fallback
 
 LEDGER_TEMPLATE = """# Session Handoff Ledger
 
@@ -128,8 +170,11 @@ def state_dir():
 # ----------------------------------------------------------- measurement ---
 
 def measure_claude(transcript_path, cfg):
-    """Real context size: token usage reported on the last assistant message."""
-    window = cfg["tools"]["claude_code"].get("window_tokens", 200000)
+    """Real context size: token usage reported on the last assistant message.
+
+    The window is resolved from the model ID on that same message, so the
+    budget respects whichever model the session is actually running.
+    """
     try:
         with open(transcript_path, "rb") as f:
             lines = f.read().decode("utf-8", errors="replace").splitlines()
@@ -142,15 +187,21 @@ def measure_claude(transcript_path, cfg):
             entry = json.loads(line)
         except ValueError:
             continue
-        usage = (entry.get("message") or {}).get("usage")
+        message = entry.get("message") or {}
+        usage = message.get("usage")
         if not usage or "input_tokens" not in usage:
             continue
+        model = message.get("model") or ""
+        if model == "<synthetic>":
+            model = ""
+        window = resolve_window(model, cfg)
         tokens = (
             usage.get("input_tokens", 0)
             + usage.get("cache_read_input_tokens", 0)
             + usage.get("cache_creation_input_tokens", 0)
         )
-        return {"tokens": tokens, "window": window, "pct": tokens * 100 // window}
+        return {"tokens": tokens, "window": window,
+                "pct": tokens * 100 // window, "model": model or "unknown"}
     return None
 
 
@@ -225,14 +276,23 @@ def decide_level(session_id, pct, cfg):
 
 # --------------------------------------------------------------- messages ---
 
+def usage_phrase(m):
+    """Human-readable usage like '55% (~110,000 of 200,000 tokens, model X)'."""
+    phrase = "{pct}% (~{tok:,} of {win:,} tokens".format(
+        pct=m["pct"], tok=m["tokens"], win=m["window"])
+    if m.get("model"):
+        phrase += ", model {}".format(m["model"])
+    return phrase + ")"
+
+
 def warn_message(m, cfg):
     return (
-        "CONTEXT BUDGET WARNING: estimated context usage is {pct}% of the window "
-        "(~{tok} of {win} tokens); forced handoff triggers at {hard}%. Aim to reach "
-        "a clean stopping point on the current slice. Do not start any new stage, "
+        "CONTEXT BUDGET WARNING: estimated context usage is {usage} of the "
+        "window; forced handoff triggers at {hard}%. Aim to reach a clean "
+        "stopping point on the current slice. Do not start any new stage, "
         "large exploration, or broad refactor in this session. Prefer finishing and "
         "verifying what is in flight so the handoff is clean."
-    ).format(pct=m["pct"], tok=m["tokens"], win=m["window"], hard=cfg["handoff_pct"])
+    ).format(usage=usage_phrase(m), hard=cfg["handoff_pct"])
 
 
 def handoff_message(m, cfg, snapshot_path=None):
@@ -243,8 +303,8 @@ def handoff_message(m, cfg, snapshot_path=None):
         else ""
     )
     return (
-        "CONTEXT BUDGET EXCEEDED: estimated context usage is {pct}% (~{tok} of "
-        "{win} tokens), above the {hard}% handoff threshold. STOP taking on new "
+        "CONTEXT BUDGET EXCEEDED: estimated context usage is {usage}, above the "
+        "{hard}% handoff threshold. STOP taking on new "
         "work now. Do the following in order: (1) finish or safely park ONLY the "
         "atomic step currently in progress — do not start the next step; "
         "(2) append a handoff entry to {ledger} following the entry format "
@@ -254,7 +314,7 @@ def handoff_message(m, cfg, snapshot_path=None):
         "user: context budget reached, handoff written, please start a FRESH "
         "session. Do not attempt further implementation in this session."
     ).format(
-        pct=m["pct"], tok=m["tokens"], win=m["window"], hard=cfg["handoff_pct"],
+        usage=usage_phrase(m), hard=cfg["handoff_pct"],
         ledger=cfg["ledger_path"], snap=snap,
     )
 
@@ -716,6 +776,53 @@ def cmd_run(args):
     sys.exit(1)
 
 
+# ------------------------------------------------------------------ engage ---
+
+def cmd_engage(args):
+    """Chain INTERACTIVE Claude Code sessions through the ledger.
+
+    Launches `claude` in the current terminal; when the session ends and a
+    new handoff entry was appended (i.e. the budget fired and the agent wrote
+    its handoff), launches a fresh session — which the SessionStart hook
+    bootstraps from that entry. The human stays in the loop but never has to
+    re-orient the agent between sessions.
+    """
+    cfg = load_config(args.workspace)
+    ledger = ensure_ledger(args.workspace, cfg)
+    claude_cmd = args.claude_cmd or "claude"
+    max_sessions = args.max_sessions or cfg.get("max_sessions", 8)
+
+    for i in range(1, max_sessions + 1):
+        before = last_ledger_entry(ledger)
+        print("\n[context-governor] session {}/{} — launching: {}".format(
+            i, max_sessions, claude_cmd))
+        try:
+            subprocess.run(claude_cmd, shell=True, cwd=args.workspace)
+        except KeyboardInterrupt:
+            print("\n[context-governor] interrupted; stopping engagement.")
+            return
+        after = last_ledger_entry(ledger)
+        if not after or after == before:
+            print("[context-governor] no new ledger entry — session ended "
+                  "without a handoff. Stopping engagement.")
+            return
+        if is_done(after):
+            print("[context-governor] ledger says DONE. Engagement complete "
+                  "after {} session(s).".format(i))
+            return
+        step = re.search(r"next step.*", after, re.I)
+        print("[context-governor] handoff recorded; {}".format(
+            step.group(0) if step else "(no next-step line found)"))
+        if not args.auto:
+            try:
+                answer = input("[context-governor] start fresh session? [Y/n] ")
+            except EOFError:
+                return
+            if answer.strip().lower() in ("n", "no", "q"):
+                return
+    print("[context-governor] reached max sessions ({}).".format(max_sessions))
+
+
 # ---------------------------------------------------------------- status ---
 
 def cmd_status():
@@ -728,20 +835,23 @@ def cmd_status():
         tokens = os.path.getsize(path) // cfg["tools"]["cursor"].get("bytes_per_token", 4)
         window = cfg["tools"]["cursor"].get("window_tokens", 200000)
         rows.append((os.path.getmtime(path), "cursor",
-                     Path(path).stem[:8], tokens, tokens * 100 // window))
+                     Path(path).stem[:8], tokens, tokens * 100 // window, ""))
     claude_root = Path.home() / ".claude" / "projects"
     for path in glob.glob(str(claude_root / "*" / "*.jsonl")):
         m = measure_claude(path, cfg)
         if m:
             rows.append((os.path.getmtime(path), "claude",
-                         Path(path).stem[:8], m["tokens"], m["pct"]))
+                         Path(path).stem[:8], m["tokens"], m["pct"],
+                         "{} ({:,})".format(m["model"], m["window"])))
     rows.sort(reverse=True)
-    print("{:<8} {:<10} {:>12} {:>6}   thresholds: warn {}% / handoff {}%".format(
-        "tool", "session", "est_tokens", "pct", cfg["warn_pct"], cfg["handoff_pct"]))
-    for _, tool, session, tokens, pct in rows[:15]:
+    print("{:<8} {:<10} {:>12} {:>6}   {:<32} thresholds: warn {}% / handoff {}%".format(
+        "tool", "session", "est_tokens", "pct", "model (window)",
+        cfg["warn_pct"], cfg["handoff_pct"]))
+    for _, tool, session, tokens, pct, model in rows[:15]:
         flag = " <-- OVER BUDGET" if pct >= cfg["handoff_pct"] else (
             " <-- warn" if pct >= cfg["warn_pct"] else "")
-        print("{:<8} {:<10} {:>12,} {:>5}%{}".format(tool, session, tokens, pct, flag))
+        print("{:<8} {:<10} {:>12,} {:>5}%   {:<32}{}".format(
+            tool, session, tokens, pct, model, flag))
 
 
 # ------------------------------------------------------------------ main ---
@@ -755,6 +865,13 @@ def main():
     pc.add_argument("--out", required=True)
     pc.add_argument("--workspace", default=os.getcwd())
     sub.add_parser("status")
+    pe = sub.add_parser("engage")
+    pe.add_argument("--workspace", default=os.getcwd())
+    pe.add_argument("--claude-cmd", default="",
+                    help="interactive agent command (default: claude)")
+    pe.add_argument("--max-sessions", type=int, default=0)
+    pe.add_argument("--auto", action="store_true",
+                    help="relaunch the next session without asking")
     pr = sub.add_parser("run")
     pr.add_argument("--workspace", default=os.getcwd())
     pr.add_argument("--task", default="",
@@ -773,6 +890,8 @@ def main():
         cmd_compact(args)
     elif args.cmd == "status":
         cmd_status()
+    elif args.cmd == "engage":
+        cmd_engage(args)
     elif args.cmd == "run":
         cmd_run(args)
     else:

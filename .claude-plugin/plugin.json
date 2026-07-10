@@ -1,0 +1,12 @@
+{
+  "name": "context-governor",
+  "description": "Context-budget engine for Claude Code: warns at 50% of the model's context window, forces a structured handoff to an append-only ledger at 60%, and bootstraps the next session from that ledger automatically.",
+  "version": "0.2.0",
+  "author": {
+    "name": "Vikram Shekhar"
+  },
+  "homepage": "https://github.com/vsrox-cliqq/context-governor",
+  "repository": "https://github.com/vsrox-cliqq/context-governor",
+  "license": "MIT",
+  "keywords": ["context", "handoff", "budget", "hooks", "session"]
+}

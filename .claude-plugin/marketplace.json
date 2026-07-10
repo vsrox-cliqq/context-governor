@@ -1,0 +1,13 @@
+{
+  "name": "context-governor",
+  "owner": {
+    "name": "Vikram Shekhar"
+  },
+  "plugins": [
+    {
+      "name": "context-governor",
+      "source": "./",
+      "description": "Context-budget engine: warn at 50%, forced structured handoff at 60%, automatic next-session bootstrap from an append-only ledger. Model-aware (1M vs 200K windows detected from the transcript)."
+    }
+  ]
+}

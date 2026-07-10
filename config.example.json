@@ -11,6 +11,7 @@
   "agent_cmd": "",
   "max_sessions": 8,
   "session_timeout": 3600,
+  "model_windows": {},
   "tools": {
     "cursor": { "window_tokens": 200000, "bytes_per_token": 4 },
     "claude_code": { "window_tokens": 200000 }
