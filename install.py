@@ -115,8 +115,9 @@ def main():
     if args.claude or args.all:
         install_claude(Path.home() / ".claude" / "settings.json")
 
-    print("\nDone. Restart Cursor / Claude Code if hooks don't fire immediately.")
-    print("Config: ~/.context-governor/config.json (see config.example.json).")
+    print("\nDone. Restart Cursor / Claude Code — hooks load at session start.")
+    print("Verify after working a while:  python3 \"{}\" status".format(GOVERNOR))
+    print("Config (optional): ~/.context-governor/config.json (see config.example.json).")
 
 
 if __name__ == "__main__":
