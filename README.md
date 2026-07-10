@@ -4,7 +4,7 @@
 
 # context-governor
 
-**Stop Claude Code before quality degrades — not after.**
+**Structured handoff for multi-session agentic work.**
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-58a6ff?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![Tests](https://img.shields.io/badge/tests-27%20passing-3fb950?style=flat-square)](#)
@@ -15,45 +15,78 @@
 
 ---
 
-For a long implementation, run this from your project directory **instead of** `claude`:
+## The problem
 
-```bash
-governor engage   # this launches Claude — don't open claude separately
-```
+Long agentic sessions degrade. Past ~60% of the context window, Claude drifts — it forgets constraints, revisits decisions, and redoes work it already completed. By the time you notice, quality has already slipped.
 
-`engage` starts a Claude Code session in your terminal. You work in it exactly as normal. When context approaches the danger zone, the governor fires a clean handoff: the agent appends a structured entry to a local ledger and ends the session. `engage` notices, relaunches a fresh Claude session, and the `SessionStart` hook bootstraps it from that entry. The new session starts from "Next step", not from zero. The between-session re-orientation ritual disappears.
-
-Long agentic sessions degrade: past ~60% of the context window, models drift, forget constraints, and redo work. Claude Code's built-in auto-compact is a seatbelt, not a plan — it fires near ~90–95% (after quality has already degraded), summarizes lossily in-session, and leaves no external record.
-
-`context-governor` is the hook-based engine that makes this work:
-
-1. **Measures** real context usage after every tool call — exact token counts from the transcript, against the **actual model's window** (1M for Fable 5 / Opus 4.6+ / Sonnet 4.6+; detected automatically).
-2. **Warns** the agent at 50%: *finish the slice in flight, start nothing new.*
-3. **Forces a handoff** at 60%: the agent appends a structured entry to an append-only **handoff ledger** and ends the session — while a detached compactor snapshots state in the background.
-4. **Bootstraps** the next session automatically via a `SessionStart` hook — the fresh session starts from "Next step", not from zero.
-5. **`engage`** chains the above into a continuous loop: relaunch after each handoff (staying in the loop), or `run` for fully unattended execution until the ledger says DONE.
-
-One file · Python 3.9+ · stdlib only · auditable in five minutes.
-
----
-
-## Why not just use auto-compact?
+The two built-in remedies don't fix this:
 
 | | auto-compact | `/compact` | **context-governor** |
 |---|:---:|:---:|:---:|
-| Fires at | ~90–95% | user-triggered | **50% warn / 60% stop** |
-| Output | in-session summary | in-session summary | **git-committable ledger** |
-| Inspectable | ✗ | ✗ | **✓** |
+| Fires at | ~90–95% | whenever you remember | **50% warn / 60% stop** |
+| Output | lossy in-session summary | lossy in-session summary | **structured ledger entry** |
+| Inspectable / committable | ✗ | ✗ | **✓** |
 | Next session bootstrapped | ✗ | ✗ | **✓** |
-| Human judgment needed | ✗ | **✓** | ✗ |
+| Requires you to be watching | ✗ | **✓** | ✗ |
 
-On 1M-window models (Opus 4.6+, Sonnet 4.6, Fable 5) auto-compact effectively never fires before the 60% handoff — so the two coexist cleanly, and the governor is the sole handoff mechanism.
+**Auto-compact** fires after the damage is done, summarizes lossily inside the same session, and leaves no external record. On 1M-window models (Opus 4.6+, Sonnet 4.6+, Fable 5) it effectively never fires before the 60% handoff anyway — so the two coexist cleanly.
+
+**`/compact`** is better than nothing, but it's manual — you have to be watching, you have to time it right, and the summary still lives only inside the session. There's nothing to diff, nothing to commit, no automatic bootstrap for the next session.
+
+What neither gives you: a running external record of where the agent is in a plan, so the *next* session can pick up exactly where the last one left off without re-orientation.
+
+---
+
+## How it works
+
+Context-governor runs as a Claude Code hook — after every tool call and at session start. No new process to manage; the hooks fire automatically.
+
+**The full cycle:**
+
+```
+Every tool call
+  └─ measure exact token count from transcript
+       └─ resolve model window (1M or 200K, auto-detected)
+
+  [ 0% → 50% ]   silent — ~10ms overhead per tool call
+
+  [ at 50% ]     ⚠ WARN: finish the slice in flight, start nothing new
+                         handoff triggers at 60%
+
+  [ at 60% ]     🛑 HANDOFF: agent writes a structured entry to
+                    handoff/LEDGER.md (next step, open risks, key files,
+                    verification status), then ends the session.
+                    Re-fires every 3% if the agent ignores it.
+
+                 ↓ background compactor snapshots the transcript
+
+  [ next session start ]
+                 SessionStart hook reads the last ledger entry →
+                 injects it as context → agent starts from "Next step",
+                 not from zero.
+```
+
+The ledger is append-only, human-readable, and git-committable. It's not a summary — it's a handoff protocol: exact next action, what was verified, what's open, which files matter.
+
+---
+
+## What this makes possible
+
+With a build plan or spec in your repo, you can run:
+
+```bash
+governor engage
+```
+
+and work through it across as many sessions as it takes — without re-orientation between sessions, without babysitting context, without manually running `/compact` at the right moment. Each session picks up from the last ledger entry. The governor fires the handoff; `engage` relaunches the session; the hook bootstraps it. You keep working.
+
+This is what makes **spec-driven multi-session development** practical: write the plan once, execute across N sessions, let the ledger carry the state.
 
 ---
 
 ## Install
 
-One install gives you everything — the measuring hooks **and** the `governor` command (`engage`, `run`, `status`). Every path below ends the same way: two hooks merged into `~/.claude/settings.json` (timestamped backup written first, existing hooks never clobbered) plus a `governor` launcher in `~/.local/bin`. Then restart Claude Code — hooks load at session start.
+One install gives you everything — the measuring hooks **and** the `governor` command (`engage`, `run`, `status`). Every path below merges two hooks into `~/.claude/settings.json` (timestamped backup written first, existing hooks never clobbered) and drops a `governor` launcher in `~/.local/bin`. Then restart Claude Code.
 
 ### Easiest: let Claude Code install it
 
@@ -80,7 +113,7 @@ Installs to `~/.context-governor/app` (re-running updates it in place).
 /plugin install context-governor@context-governor
 ```
 
-> **Plugin caveats:** the plugin wires the hooks only — it doesn't add the `governor` command, so for `engage`/`run`/`status` use one of the installer paths instead. And in the desktop app, plugin hooks only fire in **Cowork** sessions, not the regular Code tab; desktop users should also prefer the installer paths (the desktop app shares `~/.claude/settings.json` with the CLI, so one install covers both — **quit and relaunch** afterwards; hooks don't hot-reload).
+> **Plugin caveats:** the plugin wires the hooks only — it doesn't add the `governor` command, so for `engage`/`run`/`status` use one of the installer paths instead. And in the desktop app, plugin hooks only fire in **Cowork** sessions, not the regular Code tab; desktop users should prefer the installer paths (the desktop app shares `~/.claude/settings.json` with the CLI — **quit and relaunch** afterwards).
 
 ### Manual
 
@@ -98,60 +131,24 @@ After restarting Claude Code and working for a bit:
 governor status
 ```
 
-If recent sessions appear with token counts and model names, the hooks are firing. (If `governor` isn't found, `~/.local/bin` isn't on your PATH — the installer prints the one-liner to fix that; or call `python3 ~/.context-governor/app/governor.py status` directly.)
+If recent sessions appear with token counts and model names, the hooks are firing. (If `governor` isn't found, `~/.local/bin` isn't on your PATH — the installer prints the one-liner to fix that.)
 
 ---
 
-## Model-aware budgeting
+## `engage` — multi-session mode
 
-The governor reads the model ID from the transcript and resolves the context window automatically — no config needed for common models:
-
-| Model | Window |
-|---|---|
-| Claude Fable 5 / Mythos 5 | 1,000,000 |
-| Claude Opus 4.6 / 4.7 / 4.8 | 1,000,000 |
-| Claude Sonnet 4.6 / Sonnet 5 | 1,000,000 |
-| Any model with `[1m]` suffix (1M beta) | 1,000,000 |
-| Claude Haiku 4.5, older Opus / Sonnet | 200,000 |
-
-Unknown models fall back to `tools.claude_code.window_tokens` (default 200,000). To override any model, add it to `model_windows` in your config — any substring of the model ID works as the key:
-
-```json
-{ "model_windows": { "claude-sonnet-4-6": 200000 } }
-```
-
-Every warn/handoff message and `status` row shows the resolved model and window, so a wrong assumption is immediately visible.
-
----
-
-## What happens inside a session
-
-```
-[ 0%  → 50% ]  silent — the hook adds ~10ms per tool call, nothing else
-
-[ at 50% ]     ⚠  CONTEXT BUDGET WARNING: finish slice in flight,
-                   start nothing new, handoff triggers at 60%
-
-[ at 60% ]     🛑 CONTEXT BUDGET EXCEEDED: park current step, append
-                   handoff entry to handoff/LEDGER.md, end the session.
-                   Re-fires every 3% if ignored.
-
-[ next session] SessionStart hook injects the last ledger entry → agent
-                starts from "Next step", not from zero.
-                With `engage`: this relaunch is automatic.
-```
-
----
-
-## `engage` options
+Run this **instead of** `claude` in your terminal:
 
 ```bash
+cd your-project
 governor engage            # asks before each relaunch
 governor engage --auto     # relaunches without asking
 governor engage --max-sessions 12 --claude-cmd "claude --profile work"
 ```
 
-Stops automatically when a session ends without a handoff (natural finish or you quit), or when the ledger's "Next step" says `DONE`. No installation beyond the standard install — `engage` requires only the `claude` CLI and runs in any terminal.
+`engage` launches Claude, watches for handoff entries in the ledger, and relaunches automatically when one appears. You work in each session normally; the between-session gap disappears. Stops when a session ends without a handoff (natural finish or you quit), or when the ledger says `DONE`.
+
+No extra installation — `engage` requires only the `claude` CLI and runs in any terminal.
 
 ## Fully autonomous mode: `run`
 
@@ -163,6 +160,28 @@ governor run --workspace /path/to/repo \
 Loops headless `claude -p` sessions — each scoped to one plan slice — until the ledger says `DONE`. Safety rails: no-progress stop, `max_sessions` cap (default 8), per-session `session_timeout` (default 1h), full log at `~/.context-governor/state/run-<ts>.log`.
 
 Headless agents need permission flags: `--agent-cmd 'claude -p {prompt} --permission-mode acceptEdits'` — grant only what you're comfortable with.
+
+---
+
+## Model-aware budgeting
+
+The governor reads the model ID from the transcript and resolves the context window automatically:
+
+| Model | Window |
+|---|---|
+| Claude Fable 5 / Mythos 5 | 1,000,000 |
+| Claude Opus 4.6 / 4.7 / 4.8 | 1,000,000 |
+| Claude Sonnet 4.6 / Sonnet 5 | 1,000,000 |
+| Any model with `[1m]` suffix (1M beta) | 1,000,000 |
+| Claude Haiku 4.5, older Opus / Sonnet | 200,000 |
+
+Unknown models fall back to `window_tokens` (default 200,000). To override any model, add it to `model_windows` in your config — any substring of the model ID works as the key:
+
+```json
+{ "model_windows": { "claude-sonnet-4-6": 200000 } }
+```
+
+Every warn/handoff message and `status` row shows the resolved model and window, so a wrong assumption is immediately visible.
 
 ---
 
@@ -212,7 +231,7 @@ AGENT_INSTALL.md        # step-by-step guide an AI agent follows to install this
 hooks/hooks.json        # plugin hook wiring (PostToolUse + SessionStart)
 config.example.json
 assets/
-  governor.svg          # the Context Cop (animated mascot)
+  governor.png          # the Governor mascot
 tests/
   test_governor.py      # 27 tests, no dependencies
 ```
