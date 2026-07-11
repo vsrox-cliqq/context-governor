@@ -22,6 +22,8 @@ Subcommands:
            session ends after a handoff, relaunch a fresh bootstrapped one
   run      fully autonomous mode: loop headless agent sessions, each scoped to
            one plan slice ending in a ledger entry, until the ledger says DONE
+  install  self-installer: merge the hooks into Claude Code (and/or Cursor)
+           config, put a `governor` launcher on the PATH
 """
 
 import argparse
@@ -854,6 +856,182 @@ def cmd_status():
             tool, session, tokens, pct, model, flag))
 
 
+# --------------------------------------------------------------- install ---
+
+HOOK_CMD = 'python3 "{}" hook'.format(Path(__file__).resolve())
+
+CURSOR_RULE = """\
+---
+description: Multi-session plan execution protocol — bootstrap from and write to the handoff ledger (context-governor)
+alwaysApply: true
+---
+
+# Multi-session plan execution protocol
+
+This workspace runs long plans across many agent sessions with a hard context
+budget. A hook (context-governor) monitors context usage and will instruct you
+when the budget is reached.
+
+## At session start (before any other work)
+
+1. Read the LAST entry of `handoff/LEDGER.md`. If it exists, treat its "Next
+   step" as your starting task and its "Open risks" as constraints. If it
+   references a state snapshot file, read that too. Do not re-derive state the
+   ledger already records.
+2. Scope the session to ONE plan slice (one stage or sub-task sized to fit
+   well inside the context budget). State the slice you are taking before
+   starting.
+
+## While working
+
+- Prefer targeted reads over broad exploration; the plan docs and ledger
+  already carry the project state.
+- When a hook message reports a CONTEXT BUDGET WARNING, stop starting new work
+  and drive the in-flight step to a verifiable stopping point.
+
+## At handoff (when the hook reports CONTEXT BUDGET EXCEEDED, or the session ends mid-plan)
+
+1. Append an entry to `handoff/LEDGER.md` using the format documented at the
+   top of that file. Never edit prior entries.
+2. A valid entry MUST contain a concrete, singular "Next step" and a
+   "Verification status". If verification was not run, say so explicitly — do
+   not claim done.
+3. Tell the user to start a fresh session; the new session will bootstrap from
+   the ledger automatically.
+"""
+
+
+def _install_backup(path):
+    if path.exists():
+        dest = path.with_name(path.name + ".bak." + time.strftime("%Y%m%d%H%M%S"))
+        shutil.copy2(path, dest)
+        print("  backup: {}".format(dest))
+
+
+def _install_load_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except ValueError:
+        print("ERROR: {} exists but is not valid JSON; fix it first.".format(path))
+        sys.exit(1)
+
+
+def install_claude(settings_file):
+    data = _install_load_json(settings_file)
+    hooks = data.setdefault("hooks", {})
+    changed = False
+    for event in ("PostToolUse", "SessionStart"):
+        matchers = hooks.setdefault(event, [])
+        already = any(
+            h.get("command") == HOOK_CMD
+            for m in matchers
+            for h in m.get("hooks", [])
+        )
+        if already:
+            print("  claude: {} already installed".format(event))
+            continue
+        matchers.append({"hooks": [{"type": "command", "command": HOOK_CMD}]})
+        changed = True
+        print("  claude: added {} hook".format(event))
+    if changed:
+        _install_backup(settings_file)
+        settings_file.parent.mkdir(parents=True, exist_ok=True)
+        settings_file.write_text(json.dumps(data, indent=2) + "\n")
+        print("  claude: wrote {}".format(settings_file))
+
+
+def install_cursor(hooks_file):
+    data = _install_load_json(hooks_file)
+    data.setdefault("version", 1)
+    hooks = data.setdefault("hooks", {})
+    entries = hooks.setdefault("postToolUse", [])
+    if any(e.get("command") == HOOK_CMD for e in entries):
+        print("  cursor: already installed in {}".format(hooks_file))
+        return
+    _install_backup(hooks_file)
+    entries.append({"command": HOOK_CMD, "timeout": 10})
+    hooks_file.parent.mkdir(parents=True, exist_ok=True)
+    hooks_file.write_text(json.dumps(data, indent=2) + "\n")
+    print("  cursor: installed postToolUse hook in {}".format(hooks_file))
+
+
+def install_cursor_rule(project_dir):
+    """Write the session-bootstrap rule into the project (Cursor has no
+    hook-based context injection at session start, so a rule does it)."""
+    rules_dir = Path(project_dir) / ".cursor" / "rules"
+    dest = rules_dir / "session-handoff.mdc"
+    if dest.exists():
+        print("  cursor: rule already present at {}".format(dest))
+        return
+    rules_dir.mkdir(parents=True, exist_ok=True)
+    dest.write_text(CURSOR_RULE)
+    print("  cursor: bootstrap rule installed at {}".format(dest))
+
+
+def _ensure_on_path(bin_dir, modify_path):
+    """Make sure bin_dir is reachable. If it isn't on PATH, append one export
+    line to the user's shell rc (rustup-style) unless --no-modify-path."""
+    if str(bin_dir) in os.environ.get("PATH", "").split(os.pathsep):
+        return True
+    line = 'export PATH="$HOME/.local/bin:$PATH"'
+    if not modify_path:
+        print("  NOTE: {} is not on your PATH (--no-modify-path given). "
+              "Add it yourself:\n    {}".format(bin_dir, line))
+        return False
+    shell = os.path.basename(os.environ.get("SHELL", ""))
+    rc_name = {"zsh": ".zshrc", "bash": ".bashrc"}.get(shell, ".profile")
+    rc_path = Path.home() / rc_name
+    try:
+        content = rc_path.read_text()
+    except (FileNotFoundError, OSError):
+        content = ""
+    if line in content:
+        print("  path: {} already exports ~/.local/bin — open a new shell "
+              "for `governor` to resolve".format(rc_path))
+        return False
+    with open(rc_path, "a") as f:
+        f.write("\n# added by context-governor installer\n{}\n".format(line))
+    print("  path: added ~/.local/bin to PATH in {} — open a new shell "
+          "(or `exec {}`) for `governor` to resolve".format(rc_path, shell or "sh"))
+    return False
+
+
+def install_launcher(modify_path=True):
+    """Put a `governor` command on the PATH so engage/status/run are typeable
+    from any project directory (instead of python3 <long path>/governor.py)."""
+    bin_dir = Path.home() / ".local" / "bin"
+    launcher = bin_dir / "governor"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    launcher.write_text('#!/bin/sh\nexec python3 "{}" "$@"\n'
+                        .format(Path(__file__).resolve()))
+    launcher.chmod(0o755)
+    print("  launcher: {} -> governor.py".format(launcher))
+    return _ensure_on_path(bin_dir, modify_path)
+
+
+def cmd_install(args):
+    if args.cursor or args.all:
+        install_cursor(Path.home() / ".cursor" / "hooks.json")
+    if args.cursor_project:
+        install_cursor(Path(args.cursor_project) / ".cursor" / "hooks.json")
+        install_cursor_rule(args.cursor_project)
+    if args.claude or args.all or not (args.cursor or args.cursor_project):
+        install_claude(Path.home() / ".claude" / "settings.json")
+    launcher_on_path = install_launcher(modify_path=not args.no_modify_path)
+
+    cli = "governor" if launcher_on_path else 'python3 "{}"'.format(
+        Path(__file__).resolve())
+    print("\nDone. Restart Claude Code — hooks load at session start.")
+    print("Verify after working a while:  {} status".format(cli))
+    print("Chain sessions on a long task: {} engage   (from your project dir)"
+          .format(cli))
+    print("Config (optional): ~/.context-governor/config.json "
+          "(see config.example.json).")
+
+
 # ------------------------------------------------------------------ main ---
 
 def main():
@@ -882,6 +1060,17 @@ def main():
                          "quoted prompt, otherwise the prompt is piped to "
                          "stdin (default: autodetect cursor-agent / claude)")
     pr.add_argument("--max-sessions", type=int, default=0)
+    pi = sub.add_parser("install")
+    pi.add_argument("--claude", action="store_true",
+                    help="install Claude Code hooks (the default)")
+    pi.add_argument("--cursor", action="store_true",
+                    help="install user-level Cursor hooks")
+    pi.add_argument("--cursor-project", metavar="DIR",
+                    help="install Cursor hooks + bootstrap rule in DIR")
+    pi.add_argument("--all", action="store_true",
+                    help="claude + cursor (user-level)")
+    pi.add_argument("--no-modify-path", action="store_true",
+                    help="don't append ~/.local/bin to your shell rc")
     args = parser.parse_args()
 
     if args.cmd == "hook":
@@ -894,6 +1083,8 @@ def main():
         cmd_engage(args)
     elif args.cmd == "run":
         cmd_run(args)
+    elif args.cmd == "install":
+        cmd_install(args)
     else:
         parser.print_help()
         sys.exit(1)

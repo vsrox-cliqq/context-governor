@@ -3,26 +3,21 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/vsrox-cliqq/context-governor/main/install.sh | bash
 #
-# Clones (or updates) the repo into ~/.context-governor/app and merges the
-# governor hooks into ~/.claude/settings.json (with a timestamped backup).
-# Prefer the native plugin install if you use Claude Code plugins:
-#
-#   /plugin marketplace add vsrox-cliqq/context-governor
-#   /plugin install context-governor@context-governor
+# The whole engine is one stdlib-only Python file. This downloads it to
+# ~/.context-governor/app/governor.py and runs its self-installer, which
+# merges two hooks into ~/.claude/settings.json (timestamped backup first,
+# existing hooks never clobbered) and puts a `governor` command on your PATH.
+# Re-running updates in place.
 set -euo pipefail
 
-REPO="${CG_REPO:-https://github.com/vsrox-cliqq/context-governor}"
+BASE="${CG_RAW_BASE:-https://raw.githubusercontent.com/vsrox-cliqq/context-governor/main}"
 DEST="${CG_HOME:-$HOME/.context-governor/app}"
 
-command -v git >/dev/null 2>&1 || { echo "error: git is required" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "error: python3 is required" >&2; exit 1; }
 
-if [ -d "$DEST/.git" ]; then
-  echo "Updating existing install in $DEST"
-  git -C "$DEST" pull --ff-only
-else
-  mkdir -p "$(dirname "$DEST")"
-  git clone --depth 1 "$REPO" "$DEST"
-fi
+mkdir -p "$DEST"
+curl -fsSL "$BASE/governor.py" -o "$DEST/governor.py"
+curl -fsSL "$BASE/config.example.json" -o "$DEST/config.example.json"
+chmod +x "$DEST/governor.py"
 
-python3 "$DEST/install.py" --claude
+python3 "$DEST/governor.py" install --claude "$@"

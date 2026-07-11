@@ -4,16 +4,16 @@ You are an AI coding agent (Claude Code or similar) installing **context-governo
 
 ## What you are installing
 
-Two things, from one installer run:
+The whole engine is **one stdlib-only Python file** (`governor.py`, Python 3.9+), downloaded to `~/.context-governor/app/`. Its self-installer then sets up:
 
 1. **Two hooks** in `~/.claude/settings.json` — `PostToolUse` and `SessionStart` — that run `python3 ~/.context-governor/app/governor.py hook`. They measure context usage after every tool call, warn the agent at 50% of the model's context window, force a structured handoff to a ledger at 60%, and bootstrap the next session from that ledger.
-2. **A `governor` launcher** at `~/.local/bin/governor`, so the user can run `governor engage` (chain interactive sessions through the ledger), `governor status`, and `governor run` from any project directory.
+2. **A `governor` launcher** at `~/.local/bin/governor`, so the user can run `governor engage` (chain interactive sessions through the ledger), `governor status`, and `governor run` from any project directory. If `~/.local/bin` isn't on the user's PATH, the installer appends one `export PATH=...` line to their shell rc (`~/.zshrc` / `~/.bashrc` / `~/.profile`) and says so — pass `--no-modify-path` to suppress that.
 
-No dependencies are installed; the engine is a single Python 3.9+ stdlib-only file.
+No dependencies are installed. No git checkout is needed.
 
 ## Steps
 
-1. **Check prerequisites.** Run `git --version` and `python3 --version`. Python must be 3.9 or newer. If either is missing, stop and tell the user what to install.
+1. **Check prerequisites.** Run `python3 --version` — must be 3.9 or newer. If missing, stop and tell the user what to install.
 
 2. **Run the installer:**
 
@@ -24,13 +24,15 @@ No dependencies are installed; the engine is a single Python 3.9+ stdlib-only fi
    If piping curl to bash is blocked in your environment, do the equivalent manually:
 
    ```bash
-   git clone --depth 1 https://github.com/vsrox-cliqq/context-governor ~/.context-governor/app
-   python3 ~/.context-governor/app/install.py --claude
+   mkdir -p ~/.context-governor/app
+   curl -fsSL https://raw.githubusercontent.com/vsrox-cliqq/context-governor/main/governor.py -o ~/.context-governor/app/governor.py
+   curl -fsSL https://raw.githubusercontent.com/vsrox-cliqq/context-governor/main/config.example.json -o ~/.context-governor/app/config.example.json
+   python3 ~/.context-governor/app/governor.py install --claude
    ```
 
-   (If `~/.context-governor/app` already exists as a git checkout, `git -C ~/.context-governor/app pull --ff-only` instead of cloning.)
+   (Re-running either form updates an existing install in place.)
 
-3. **Verify the hooks landed.** Read `~/.claude/settings.json` and confirm there is a `PostToolUse` entry **and** a `SessionStart` entry whose command contains `governor.py" hook`. Also confirm `~/.local/bin/governor` exists and is executable. If the installer printed a note that `~/.local/bin` is not on the user's PATH, remember it — you must relay that in your final message (relay the note; do **not** edit the user's shell profile yourself unless they ask).
+3. **Verify the hooks landed.** Read `~/.claude/settings.json` and confirm there is a `PostToolUse` entry **and** a `SessionStart` entry whose command contains `governor.py" hook`. Also confirm `~/.local/bin/governor` exists and is executable. If the installer printed that it added a PATH line to the user's shell rc, remember it — you must relay that in your final message (a new shell is needed before `governor` resolves).
 
 4. **Smoke-test the engine:**
 
@@ -44,12 +46,13 @@ No dependencies are installed; the engine is a single Python 3.9+ stdlib-only fi
    - Restart Claude Code (CLI: start a new session; desktop app: quit and relaunch).
    - After working a while, `governor status` shows recent sessions with token counts and detected model windows — if rows appear, the hooks are firing.
    - **The flagship feature:** for a long task, run `governor engage` in the project directory instead of plain `claude` — it chains interactive sessions through the handoff ledger automatically (requires the `claude` CLI).
-   - If `~/.local/bin` wasn't on their PATH, include the installer's PATH fix one-liner.
-   - Optional config lives at `~/.context-governor/config.json` (see `config.example.json` in the repo); defaults are warn at 50%, handoff at 60%.
+   - If the installer added a PATH line to their shell rc, tell them to open a new terminal (or `exec zsh` / `exec bash`) before `governor` resolves.
+   - Optional config lives at `~/.context-governor/config.json` (see `config.example.json` next to `governor.py`); defaults are warn at 50%, handoff at 60%.
 
 ## Rules
 
 - **Do not edit `~/.claude/settings.json` by hand.** Use the installer — it merges, never clobbers existing hooks, and backs up first.
 - If the installer reports that `settings.json` exists but is invalid JSON, **stop and show the user the error** rather than repairing the file silently.
 - Do not install the Cursor variant (`--cursor`) unless the user asked for it.
-- Nothing outside `~/.context-governor/`, `~/.claude/settings.json`, and `~/.local/bin/governor` is modified. In particular, never edit the user's shell profile.
+- **Do not edit the user's shell profile yourself.** The installer's PATH fix (one export line, only when missing) is the only sanctioned modification — relay what it printed instead of adding your own.
+- Nothing outside `~/.context-governor/`, `~/.claude/settings.json`, `~/.local/bin/governor`, and (only if PATH was missing) one line in the user's shell rc is modified.

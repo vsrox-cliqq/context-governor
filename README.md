@@ -4,7 +4,7 @@
 
 # context-governor
 
-**Structured handoff for multi-session agentic work.**
+**Run Claude Code indefinitely — without the context rot.**
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-58a6ff?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![Tests](https://img.shields.io/badge/tests-27%20passing-3fb950?style=flat-square)](#)
@@ -12,6 +12,8 @@
 [![stdlib only](https://img.shields.io/badge/deps-stdlib%20only-d29922?style=flat-square)](#)
 
 </div>
+
+One task, as many sessions as it takes. The governor measures every tool call, ends the session at 60% of the context window — *before* quality drops — and boots the next session from a structured handoff ledger. Sessions chain automatically; the work never loses its place.
 
 ---
 
@@ -34,6 +36,8 @@ The two built-in remedies don't fix this:
 **`/compact`** is better than nothing, but it's manual — you have to be watching, you have to time it right, and the summary still lives only inside the session. There's nothing to diff, nothing to commit, no automatic bootstrap for the next session.
 
 What neither gives you: a running external record of where the agent is in a plan, so the *next* session can pick up exactly where the last one left off without re-orientation.
+
+The ecosystem's other answers don't fix it either. Loop tools (Ralph-style) rerun Claude until a task is done but fly blind on context — they'll happily let a session rot past 90% before it dies. Memory tools compress and recall after the fact. The governor is the piece in between: it **measures** the window on every tool call and hands off at exactly the right moment, so an indefinite run is made of sessions that are all still sharp.
 
 ---
 
@@ -70,60 +74,17 @@ The ledger is append-only, human-readable, and git-committable. It's not a summa
 
 ---
 
-## Modes
-
-The hooks run automatically once installed. You choose how to drive the sessions on top of them:
-
-| Mode | Use when | Command |
-|---|---|---|
-| **`engage`** | You're at the terminal — interactive, multi-session work against a spec or long task | `governor engage` (replaces `claude`) |
-| **`run`** | Fully unattended — headless sessions until the plan says DONE | `governor run --task "..."` |
-| **`status`** | Inspect what's been measured — recent sessions, token counts, detected models | `governor status` |
-| **`compact`** | Manual compaction of a specific transcript outside the hook cycle | `governor compact --transcript <path> --out state.md` |
-
-### `engage` — interactive multi-session
-
-Run this **instead of** `claude` in your terminal:
-
-```bash
-cd your-project
-governor engage            # asks "start fresh session?" before each relaunch
-governor engage --auto     # relaunches without asking
-governor engage --max-sessions 12 --claude-cmd "claude --profile work"
-```
-
-`engage` launches Claude, watches the ledger for new handoff entries, and relaunches a fresh session when one appears — bootstrapped automatically from that entry. You work normally inside each session; the between-session gap disappears. Stops when a session ends without a handoff (natural finish or you quit), or when the ledger says `DONE`.
-
-This is what makes **spec-driven development practical**: write the plan once, execute across as many sessions as it takes, let the ledger carry the state. No re-orientation, no lost context, no babysitting `/compact`.
-
-### `run` — autonomous / headless
-
-```bash
-governor run --workspace /path/to/repo \
-  --task "Implement the remaining stages of build-plan.md"
-```
-
-Loops headless `claude -p` sessions — each scoped to one plan slice — until the ledger says `DONE`. Safety rails: no-progress stop, `max_sessions` cap (default 8), per-session `session_timeout` (default 1h), full log at `~/.context-governor/state/run-<ts>.log`.
-
-Headless agents need permission flags: `--agent-cmd 'claude -p {prompt} --permission-mode acceptEdits'` — grant only what you're comfortable with.
-
-### `status` — inspect recent sessions
-
-```bash
-governor status
-```
-
-Prints a table of recent sessions: tool (Claude Code / Cursor), session ID, estimated tokens, percentage of window used, and detected model + window size. Run this after installing to confirm the hooks are firing.
-
----
-
 ## Install
 
-One install gives you everything — the measuring hooks **and** the `governor` command (`engage`, `run`, `status`). Every path below merges two hooks into `~/.claude/settings.json` (timestamped backup written first, existing hooks never clobbered) and drops a `governor` launcher in `~/.local/bin`. Then restart Claude Code.
+```bash
+curl -fsSL https://raw.githubusercontent.com/vsrox-cliqq/context-governor/main/install.sh | bash
+```
 
-### Easiest: let Claude Code install it
+Restart Claude Code. Done.
 
-Paste this into any Claude Code session:
+The whole engine is **one stdlib-only Python file** — the installer downloads it, registers two hooks in `~/.claude/settings.json` (timestamped backup first, existing hooks never clobbered), and puts `governor` on your PATH (adding one export line to your shell rc only if it's missing — open a new terminal in that case). Only prerequisite: Python 3.9+. Re-running updates in place.
+
+**Or let Claude Code install it for you.** Paste this into any session:
 
 ```
 Install context-governor: fetch https://raw.githubusercontent.com/vsrox-cliqq/context-governor/main/AGENT_INSTALL.md and follow it.
@@ -131,40 +92,58 @@ Install context-governor: fetch https://raw.githubusercontent.com/vsrox-cliqq/co
 
 Claude checks prerequisites, runs the installer, verifies the hooks landed, and tells you when to restart. ([AGENT_INSTALL.md](AGENT_INSTALL.md) is short — read it first if you want to know exactly what it does.)
 
-### One-liner
+To confirm it's working, work for a bit and run `governor status` — if recent sessions show up with token counts and model names, the hooks are firing.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/vsrox-cliqq/context-governor/main/install.sh | bash
-```
+<details>
+<summary><strong>Other install paths</strong> — plugin, manual</summary>
 
-Installs to `~/.context-governor/app` (re-running updates it in place).
-
-### As a Claude Code plugin
+**As a Claude Code plugin:**
 
 ```
 /plugin marketplace add vsrox-cliqq/context-governor
 /plugin install context-governor@context-governor
 ```
 
-> **Plugin caveats:** the plugin wires the hooks only — it doesn't add the `governor` command, so for `engage`/`run`/`status` use one of the installer paths instead. And in the desktop app, plugin hooks only fire in **Cowork** sessions, not the regular Code tab; desktop users should prefer the installer paths (the desktop app shares `~/.claude/settings.json` with the CLI — **quit and relaunch** afterwards).
+> The plugin wires the hooks only — it doesn't add the `governor` command, so for `engage`/`run`/`status` use the installer instead. In the desktop app, plugin hooks only fire in **Cowork** sessions, not the regular Code tab; desktop users should prefer the installer (the desktop app shares `~/.claude/settings.json` with the CLI — quit and relaunch afterwards).
 
-### Manual
+**Manual:**
 
 ```bash
 git clone https://github.com/vsrox-cliqq/context-governor
 cd context-governor
-python3 install.py --claude
+python3 governor.py install --claude
 ```
 
-### Verify
+</details>
 
-After restarting Claude Code and working for a bit:
+---
+
+## Usage
+
+One command, instead of `claude`:
 
 ```bash
-governor status
+cd your-project
+governor engage
 ```
 
-If recent sessions appear with token counts and model names, the hooks are firing. (If `governor` isn't found, `~/.local/bin` isn't on your PATH — the installer prints the one-liner to fix that.)
+Work normally. When the session hits 60% of the window, the agent writes its handoff entry and ends; `engage` relaunches a fresh session bootstrapped from that entry. The between-session gap disappears — write the plan once, execute across as many sessions as it takes. Stops when a session ends without a handoff (natural finish or you quit) or the ledger says `DONE`. Add `--auto` to skip the relaunch prompt.
+
+Fully unattended:
+
+```bash
+governor run --workspace /path/to/repo --task "Implement the remaining stages of build-plan.md"
+```
+
+Loops headless `claude -p` sessions — each scoped to one plan slice — until the ledger says `DONE`. Safety rails: no-progress stop, `max_sessions` cap (default 8), per-session timeout (default 1h), full log in `~/.context-governor/state/`. Headless agents need permission flags (`--agent-cmd 'claude -p {prompt} --permission-mode acceptEdits'`) — grant only what you're comfortable with.
+
+Even under plain `claude` — no `governor` command at all — the hooks still fire: the agent gets the warn/handoff orders, writes the ledger, and the next session you start is bootstrapped from it. `engage` and `run` just remove the manual relaunch.
+
+| Also | |
+|---|---|
+| `governor status` | recent sessions: tokens, % of window, detected model |
+| `governor engage --max-sessions 12 --claude-cmd "claude --profile work"` | caps and custom launch command |
+| `governor compact --transcript <path> --out state.md` | compact a transcript manually, outside the hook cycle |
 
 ---
 
@@ -214,9 +193,10 @@ Optional. Copy `config.example.json` to `~/.context-governor/config.json` (user-
 ## Repository layout
 
 ```
-governor.py             # the whole engine: hook / compact / status / engage / run
-install.py              # merging installer (settings.json merge)
-install.sh              # curl-able one-line installer
+governor.py             # the whole product: engine + self-installer
+                        #   (hook / compact / status / engage / run / install)
+install.sh              # curl-able one-liner: downloads governor.py, runs `install`
+install.py              # back-compat shim -> `governor.py install`
 AGENT_INSTALL.md        # step-by-step guide an AI agent follows to install this
 .claude-plugin/         # Claude Code plugin + marketplace manifests
 hooks/hooks.json        # plugin hook wiring (PostToolUse + SessionStart)
