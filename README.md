@@ -17,74 +17,19 @@ One task, as many sessions as it takes. The governor measures every tool call, e
 
 ---
 
-## The problem
-
-Long agentic sessions degrade. Past ~60% of the context window, Claude drifts — it forgets constraints, revisits decisions, and redoes work it already completed. By the time you notice, quality has already slipped.
-
-The two built-in remedies don't fix this:
-
-| | auto-compact | `/compact` | **context-governor** |
-|---|:---:|:---:|:---:|
-| Fires at | ~90–95% | whenever you remember | **50% warn / 60% stop** |
-| Output | lossy in-session summary | lossy in-session summary | **structured ledger entry** |
-| Inspectable / committable | ✗ | ✗ | **✓** |
-| Next session bootstrapped | ✗ | ✗ | **✓** |
-| Requires you to be watching | ✗ | **✓** | ✗ |
-
-**Auto-compact** fires after the damage is done, summarizes lossily inside the same session, and leaves no external record. On 1M-window models (Opus 4.6+, Sonnet 4.6+, Fable 5) it effectively never fires before the 60% handoff anyway — so the two coexist cleanly.
-
-**`/compact`** is better than nothing, but it's manual — you have to be watching, you have to time it right, and the summary still lives only inside the session. There's nothing to diff, nothing to commit, no automatic bootstrap for the next session.
-
-What neither gives you: a running external record of where the agent is in a plan, so the *next* session can pick up exactly where the last one left off without re-orientation.
-
-The ecosystem's other answers don't fix it either. Loop tools (Ralph-style) rerun Claude until a task is done but fly blind on context — they'll happily let a session rot past 90% before it dies. Memory tools compress and recall after the fact. The governor is the piece in between: it **measures** the window on every tool call and hands off at exactly the right moment, so an indefinite run is made of sessions that are all still sharp.
-
----
-
-## How it works
-
-Context-governor runs as a Claude Code hook — after every tool call and at session start. No new process to manage; the hooks fire automatically.
-
-**The full cycle:**
-
-```
-Every tool call
-  └─ measure exact token count from transcript
-       └─ resolve model window (1M or 200K, auto-detected)
-
-  [ 0% → 50% ]   silent — ~10ms overhead per tool call
-
-  [ at 50% ]     ⚠ WARN: finish the slice in flight, start nothing new
-                         handoff triggers at 60%
-
-  [ at 60% ]     🛑 HANDOFF: agent writes a structured entry to
-                    handoff/LEDGER.md (next step, open risks, key files,
-                    verification status), then ends the session.
-                    Re-fires every 3% if the agent ignores it.
-
-                 ↓ background compactor snapshots the transcript
-
-  [ next session start ]
-                 SessionStart hook reads the last ledger entry →
-                 injects it as context → agent starts from "Next step",
-                 not from zero.
-```
-
-The ledger is append-only, human-readable, and git-committable. It's not a summary — it's a handoff protocol: exact next action, what was verified, what's open, which files matter.
-
----
-
-## Install
+## Quick start
 
 ```bash
+# 1. Install — downloads one stdlib-only Python file, registers two hooks
 curl -fsSL https://raw.githubusercontent.com/vsrox-cliqq/context-governor/main/install.sh | bash
+
+# 2. Restart Claude Code, then run this in your project instead of `claude`:
+governor engage
 ```
 
-Restart Claude Code. Done.
+That's it. The installer merges the hooks into `~/.claude/settings.json` (timestamped backup first, existing hooks never touched) and puts `governor` on your PATH. Python 3.9+ is the only prerequisite; re-running updates in place.
 
-The whole engine is **one stdlib-only Python file** — the installer downloads it, registers two hooks in `~/.claude/settings.json` (timestamped backup first, existing hooks never clobbered), and puts `governor` on your PATH (adding one export line to your shell rc only if it's missing — open a new terminal in that case). Only prerequisite: Python 3.9+. Re-running updates in place.
-
-**Or let Claude Code install it for you.** Paste this into any session:
+**Or let Claude Code install it for you** — paste this into any session:
 
 ```
 Install context-governor: fetch https://raw.githubusercontent.com/vsrox-cliqq/context-governor/main/AGENT_INSTALL.md and follow it.
@@ -114,64 +59,108 @@ cd context-governor
 python3 governor.py install --claude
 ```
 
+If `~/.local/bin` wasn't on your PATH, the installer adds one export line to your shell rc — open a new terminal for `governor` to resolve (`--no-modify-path` to opt out).
+
 </details>
 
 ---
 
-## Usage
+## Why
 
-One command, instead of `claude`:
+Long agentic sessions degrade. Past ~60% of the context window, Claude drifts — it forgets constraints, revisits decisions, and redoes work it already completed. By the time you notice, quality has already slipped. The built-in remedies don't fix this:
+
+| | auto-compact | `/compact` | **context-governor** |
+|---|:---:|:---:|:---:|
+| Fires at | ~90–95% | whenever you remember | **50% warn / 60% stop** |
+| Output | lossy in-session summary | lossy in-session summary | **structured ledger entry** |
+| Inspectable / committable | ✗ | ✗ | **✓** |
+| Next session bootstrapped | ✗ | ✗ | **✓** |
+| Requires you to be watching | ✗ | **✓** | ✗ |
+
+Auto-compact fires after the damage is done and leaves no external record (on 1M-window models it effectively never fires before the 60% handoff, so the two coexist cleanly). `/compact` requires you to be watching and its summary dies with the session. The ecosystem's other answers don't fix it either: loop tools (Ralph-style) rerun Claude until a task is done but fly blind on context — they'll happily let a session rot past 90% before it dies — and memory tools compress and recall after the fact.
+
+What none of them give you: a running external record of where the agent is in the plan, so the *next* session picks up exactly where the last one left off. The governor **measures** the window on every tool call and hands off at exactly the right moment — an indefinite run made of sessions that are all still sharp.
+
+---
+
+## How it works
+
+Context-governor runs as a Claude Code hook — after every tool call and at session start. No new process to manage; the hooks fire automatically.
+
+```
+Every tool call
+  └─ measure exact token count from transcript
+       └─ resolve model window (1M or 200K, auto-detected)
+
+  [ 0% → 50% ]   silent — ~10ms overhead per tool call
+
+  [ at 50% ]     ⚠ WARN: finish the slice in flight, start nothing new
+                         handoff triggers at 60%
+
+  [ at 60% ]     🛑 HANDOFF: agent writes a structured entry to
+                    handoff/LEDGER.md (next step, open risks, key files,
+                    verification status), then ends the session.
+                    Re-fires every 3% if the agent ignores it.
+
+                 ↓ background compactor snapshots the transcript
+
+  [ next session start ]
+                 SessionStart hook reads the last ledger entry →
+                 injects it as context → agent starts from "Next step",
+                 not from zero.
+```
+
+The ledger is append-only, human-readable, and git-committable. It's not a summary — it's a handoff protocol: exact next action, what was verified, what's open, which files matter.
+
+The hooks work under plain `claude`, too: the agent still gets warned, still writes the handoff, and your next session still starts bootstrapped — you just relaunch it yourself. The two commands below only automate the relaunch.
+
+---
+
+## Commands
+
+### `governor engage` — you at the terminal
 
 ```bash
 cd your-project
 governor engage
 ```
 
-Work normally. When the session hits 60% of the window, the agent writes its handoff entry and ends; `engage` relaunches a fresh session bootstrapped from that entry. The between-session gap disappears — write the plan once, execute across as many sessions as it takes. Stops when a session ends without a handoff (natural finish or you quit) or the ledger says `DONE`. Add `--auto` to skip the relaunch prompt.
+Run it instead of `claude`. Work normally; when the session hits 60% of the window, the agent writes its handoff entry and ends, and `engage` relaunches a fresh session bootstrapped from that entry. Write the plan once, execute across as many sessions as it takes. It stops when a session ends without a handoff (natural finish, or you quit) or when the ledger says `DONE`.
 
-Fully unattended:
+- `--auto` — relaunch without asking between sessions
+- `--max-sessions 12` — hard cap on how many sessions it will chain
+- `--claude-cmd "claude --profile work"` — launch Claude with your own flags
+
+### `governor run` — nobody at the terminal
 
 ```bash
 governor run --workspace /path/to/repo --task "Implement the remaining stages of build-plan.md"
 ```
 
-Loops headless `claude -p` sessions — each scoped to one plan slice — until the ledger says `DONE`. Safety rails: no-progress stop, `max_sessions` cap (default 8), per-session timeout (default 1h), full log in `~/.context-governor/state/`. Headless agents need permission flags (`--agent-cmd 'claude -p {prompt} --permission-mode acceptEdits'`) — grant only what you're comfortable with.
+The same loop, but with no human present: each session runs Claude in headless mode, works one slice of the plan, writes its ledger entry, and exits; `run` starts the next session — until the ledger's last entry says the plan is `DONE`.
 
-Even under plain `claude` — no `governor` command at all — the hooks still fire: the agent gets the warn/handoff orders, writes the ledger, and the next session you start is bootstrapped from it. `engage` and `run` just remove the manual relaunch.
+Because nobody is watching, it knows when to stop itself:
 
-| Also | |
+- a session ends **without writing a new ledger entry** → no progress, stop
+- **8 sessions** have run (configurable) → stop
+- a single session exceeds **1 hour** (configurable) → stop
+- everything each session did is logged under `~/.context-governor/state/`
+
+One decision is yours: a headless session can't ask you "allow this edit?", so you grant permissions up front. For example, `--agent-cmd 'claude -p {prompt} --permission-mode acceptEdits'` lets sessions edit files without asking. Grant only what you're comfortable with.
+
+### The rest
+
+| | |
 |---|---|
-| `governor status` | recent sessions: tokens, % of window, detected model |
-| `governor engage --max-sessions 12 --claude-cmd "claude --profile work"` | caps and custom launch command |
-| `governor compact --transcript <path> --out state.md` | compact a transcript manually, outside the hook cycle |
+| `governor status` | table of recent sessions — tokens used, % of window, detected model. Your "is it working?" check. |
+| `governor install` | re-run the self-installer (also: `--cursor` variants) |
+| `governor compact --transcript <path> --out state.md` | snapshot a transcript into a state file by hand, outside the hook cycle |
 
 ---
 
-## Model-aware budgeting
+## Configuration
 
-The governor reads the model ID from the transcript and resolves the context window automatically:
-
-| Model | Window |
-|---|---|
-| Claude Fable 5 / Mythos 5 | 1,000,000 |
-| Claude Opus 4.6 / 4.7 / 4.8 | 1,000,000 |
-| Claude Sonnet 4.6 / Sonnet 5 | 1,000,000 |
-| Any model with `[1m]` suffix (1M beta) | 1,000,000 |
-| Claude Haiku 4.5, older Opus / Sonnet | 200,000 |
-
-Unknown models fall back to `window_tokens` (default 200,000). To override any model, add it to `model_windows` in your config — any substring of the model ID works as the key:
-
-```json
-{ "model_windows": { "claude-sonnet-4-6": 200000 } }
-```
-
-Every warn/handoff message and `status` row shows the resolved model and window, so a wrong assumption is immediately visible.
-
----
-
-## Configure
-
-Optional. Copy `config.example.json` to `~/.context-governor/config.json` (user-level) or `<workspace>/.context-governor.json` (per-project, overrides user config):
+Optional — the defaults (warn at 50%, handoff at 60%, automatic model detection) are the recommended setup. To change them, copy `config.example.json` to `~/.context-governor/config.json` (user-level) or `<workspace>/.context-governor.json` (per-project, wins over user-level):
 
 ```json
 {
@@ -184,28 +173,10 @@ Optional. Copy `config.example.json` to `~/.context-governor/config.json` (user-
 }
 ```
 
-- `model_windows` — per-model window overrides (see [Model-aware budgeting](#model-aware-budgeting)). Rarely needed; detection is automatic.
+- `warn_pct` / `handoff_pct` — the two thresholds.
+- `refire_delta_pct` — how often the handoff order repeats if the agent ignores it (default: every 3%).
 - `summarizer_cmd` — optional LLM compaction. Any command that reads a prompt on stdin and prints a summary: `claude -p --model haiku` or `ollama run llama3.2`. Leave empty for the no-LLM structural digest (fast, free, offline).
-- `refire_delta_pct` — re-fire interval if the agent ignores the handoff order (default 3%).
-
----
-
-## Repository layout
-
-```
-governor.py             # the whole product: engine + self-installer
-                        #   (hook / compact / status / engage / run / install)
-install.sh              # curl-able one-liner: downloads governor.py, runs `install`
-install.py              # back-compat shim -> `governor.py install`
-AGENT_INSTALL.md        # step-by-step guide an AI agent follows to install this
-.claude-plugin/         # Claude Code plugin + marketplace manifests
-hooks/hooks.json        # plugin hook wiring (PostToolUse + SessionStart)
-config.example.json
-assets/
-  governor.png          # the Governor mascot
-tests/
-  test_governor.py      # 27 tests, no dependencies
-```
+- `model_windows` — per-model context-window overrides. Rarely needed: the governor reads the model ID from the transcript and resolves the window automatically — 1M for Fable/Mythos 5, Opus 4.6+, Sonnet 4.6+, and `[1m]`-suffixed beta models; 200K for Haiku 4.5 and older models. Unknown models fall back to `window_tokens` (default 200,000). Any substring of the model ID works as a key: `{ "model_windows": { "claude-sonnet-4-6": 200000 } }`. Every warn/handoff message and `status` row shows the resolved model and window, so a wrong assumption is immediately visible.
 
 ---
 
@@ -231,8 +202,8 @@ The ledger doubles as a write-ahead log and its required entry format — exact 
 Cursor support is experimental. Measurement uses a byte-proxy (Cursor doesn't expose token counts directly), and session bootstrapping uses a project rule rather than a `SessionStart` hook.
 
 ```bash
-python3 install.py --cursor-project /path/to/your/repo   # per project (recommended)
-python3 install.py --cursor                              # user-level ~/.cursor/hooks.json
+governor install --cursor-project /path/to/your/repo   # per project (recommended)
+governor install --cursor                              # user-level ~/.cursor/hooks.json
 ```
 
 Cursor performs its own context summarization, so the live context may be smaller than the byte estimate — the governor hands off slightly *early*, which is the safe direction. Tune `tools.cursor.bytes_per_token` upward if it fires too soon.
