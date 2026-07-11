@@ -129,7 +129,8 @@ Run it instead of `claude`. Work normally; when the session hits 60% of the wind
 
 - `--auto` — relaunch without asking between sessions
 - `--max-sessions 12` — hard cap on how many sessions it will chain
-- `--claude-cmd "claude --profile work"` — launch Claude with your own flags
+- any `claude` flag passes through directly: `governor engage --model claude-opus-4-8` or `governor engage --profile work`
+- `--claude-cmd "my-wrapper"` — replace the `claude` binary entirely
 
 ### `governor run` — nobody at the terminal
 

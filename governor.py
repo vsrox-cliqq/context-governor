@@ -791,7 +791,8 @@ def cmd_engage(args):
     """
     cfg = load_config(args.workspace)
     ledger = ensure_ledger(args.workspace, cfg)
-    claude_cmd = args.claude_cmd or "claude"
+    extra = " ".join(shlex.quote(a) for a in (args.claude_args or []))
+    claude_cmd = (args.claude_cmd or "claude") + (" " + extra if extra else "")
     max_sessions = args.max_sessions or cfg.get("max_sessions", 8)
 
     for i in range(1, max_sessions + 1):
@@ -1046,7 +1047,7 @@ def main():
     pe = sub.add_parser("engage")
     pe.add_argument("--workspace", default=os.getcwd())
     pe.add_argument("--claude-cmd", default="",
-                    help="interactive agent command (default: claude)")
+                    help="override the full agent command (default: claude)")
     pe.add_argument("--max-sessions", type=int, default=0)
     pe.add_argument("--auto", action="store_true",
                     help="relaunch the next session without asking")
@@ -1071,7 +1072,11 @@ def main():
                     help="claude + cursor (user-level)")
     pi.add_argument("--no-modify-path", action="store_true",
                     help="don't append ~/.local/bin to your shell rc")
-    args = parser.parse_args()
+    args, unknown = parser.parse_known_args()
+    if hasattr(args, "claude_args"):
+        args.claude_args = (args.claude_args or []) + unknown
+    elif args.cmd == "engage":
+        args.claude_args = unknown
 
     if args.cmd == "hook":
         cmd_hook()
