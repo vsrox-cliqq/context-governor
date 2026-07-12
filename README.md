@@ -15,6 +15,8 @@
 
 One task, as many sessions as it takes. The governor measures every tool call, ends the session at 60% of the context window — *before* quality drops — and boots the next session from a structured handoff ledger. Sessions chain automatically; the work never loses its place.
 
+It's not a loop tool. Loops (`/loop`, Ralph-style) rerun Claude blind and let each session rot before it dies; the governor watches the window and hands off at the exact right moment, with a written record the next session starts from.
+
 ---
 
 ## Quick start
@@ -67,17 +69,16 @@ If `~/.local/bin` wasn't on your PATH, the installer adds one export line to you
 
 ## Why
 
-Long agentic sessions degrade. Past ~60% of the context window, Claude drifts — it forgets constraints, revisits decisions, and redoes work it already completed. By the time you notice, quality has already slipped. The built-in remedies don't fix this:
+Long agentic sessions degrade. Past ~60% of the context window, Claude drifts — it forgets constraints, revisits decisions, and redoes work it already completed. By the time you notice, quality has already slipped. The existing remedies don't fix this:
 
-| | auto-compact | `/compact` | **context-governor** |
-|---|:---:|:---:|:---:|
-| Fires at | ~90–95% | whenever you remember | **50% warn / 60% stop** |
-| Output | lossy in-session summary | lossy in-session summary | **structured ledger entry** |
-| Inspectable / committable | ✗ | ✗ | **✓** |
-| Next session bootstrapped | ✗ | ✗ | **✓** |
-| Requires you to be watching | ✗ | **✓** | ✗ |
+| | auto-compact | `/compact` | loop tools (`/loop`, Ralph) | **context-governor** |
+|---|:---:|:---:|:---:|:---:|
+| Watches context usage | fires at ~90–95% | only if *you* are | ✗ — reruns blind | **every tool call: 50% warn / 60% stop** |
+| Chains fresh sessions | ✗ | ✗ | ✓ | **✓** |
+| State carried forward | lossy in-session summary | lossy in-session summary | same prompt again; progress re-derived | **structured ledger entry** |
+| Inspectable / committable | ✗ | ✗ | ✗ | **✓** |
 
-Auto-compact fires after the damage is done and leaves no external record (on 1M-window models it effectively never fires before the 60% handoff, so the two coexist cleanly). `/compact` requires you to be watching and its summary dies with the session. The ecosystem's other answers don't fix it either: loop tools (Ralph-style) rerun Claude until a task is done but fly blind on context — they'll happily let a session rot past 90% before it dies — and memory tools compress and recall after the fact.
+Auto-compact fires after the damage is done and leaves no external record (on 1M-window models it effectively never fires before the 60% handoff, so the two coexist cleanly). `/compact` requires you to be watching and its summary dies with the session. Loop tools get the *shape* right — fresh sessions until the task is done — but each lap flies blind on context and starts by re-deriving where the last one got to.
 
 What none of them give you: a running external record of where the agent is in the plan, so the *next* session picks up exactly where the last one left off. The governor **measures** the window on every tool call and hands off at exactly the right moment — an indefinite run made of sessions that are all still sharp.
 
