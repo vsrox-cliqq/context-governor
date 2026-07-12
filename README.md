@@ -130,6 +130,7 @@ Run it instead of `claude`. Work normally; when the session hits 60% of the wind
 **Pinning a model** — any `claude` flag passes straight through, and every chained session relaunches with the same flags. This matters for long runs: pin a cheaper or specific model once and the whole chain honors it, instead of resetting to your default on every fresh session:
 
 ```bash
+governor engage --model claude-sonnet-4-6            # pin Sonnet 4.6 for the whole run
 governor engage --model claude-haiku-4-5-20251001    # cheap model for grunt work
 governor engage --model claude-opus-4-8 --auto       # heavyweight, no prompts between sessions
 ```
