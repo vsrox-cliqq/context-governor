@@ -127,10 +127,18 @@ governor engage
 
 Run it instead of `claude`. Work normally; when the session hits 60% of the window, the agent writes its handoff entry and ends, and `engage` relaunches a fresh session bootstrapped from that entry. Write the plan once, execute across as many sessions as it takes. It stops when a session ends without a handoff (natural finish, or you quit) or when the ledger says `DONE`.
 
+**Pinning a model** — any `claude` flag passes straight through, and every chained session relaunches with the same flags. This matters for long runs: pin a cheaper or specific model once and the whole chain honors it, instead of resetting to your default on every fresh session:
+
+```bash
+governor engage --model claude-haiku-4-5-20251001    # cheap model for grunt work
+governor engage --model claude-opus-4-8 --auto       # heavyweight, no prompts between sessions
+```
+
+Other options:
+
 - `--auto` — relaunch without asking between sessions
 - `--max-sessions 12` — hard cap on how many sessions it will chain
-- any `claude` flag passes through directly: `governor engage --model claude-opus-4-8` or `governor engage --profile work`
-- `--claude-cmd "my-wrapper"` — replace the `claude` binary entirely
+- `--claude-cmd "my-wrapper"` — replace the `claude` binary entirely (passthrough flags are appended to it)
 
 ### `governor run` — nobody at the terminal
 
