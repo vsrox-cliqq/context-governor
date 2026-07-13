@@ -1,6 +1,6 @@
 <div align="center">
 
-<video src="assets/governor-demo.mp4" autoplay loop muted playsinline width="600" style="border-radius:12px"></video>
+<img src="assets/governor.png" alt="The Governor — context-governor mascot" width="300"/>
 
 # context-governor
 
